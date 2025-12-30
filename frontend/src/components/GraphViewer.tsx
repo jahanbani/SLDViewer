@@ -420,19 +420,20 @@ function repositionEquipment(cy: Core, verticalBuses: Set<string>): void {
 }
 
 // Spacing between parallel routing channels to prevent line overlap
-const CHANNEL_SPACING = 15;
-// Minimum distance from bus edge for routing
-const MIN_BUS_CLEARANCE = 25;
+const CHANNEL_SPACING = 20;
+// Base turn distance from source for taxi routing
+const BASE_TURN_DISTANCE = 40;
 
 /**
  * Optimize edge routing to prevent overlapping and sticking to buses.
  *
  * Rules:
- * 1. No line should stick to a bus (run parallel along its edge)
- * 2. No lines should overlap for more than a few pixels
+ * 1. All line angles must be 90 degrees (orthogonal)
+ * 2. No line should stick to a bus (run parallel along its edge)
+ * 3. No lines should overlap for more than a few pixels
  *
- * Solution: Use segment-based routing with unique perpendicular offsets
- * for each edge, creating parallel "routing channels".
+ * Solution: Use taxi routing with different taxi-turn values for each edge,
+ * creating parallel orthogonal "routing channels".
  */
 function optimizeEdgeRouting(cy: Core, verticalBuses: Set<string>): void {
   // Group edges by their source bus to assign different channels
@@ -491,44 +492,44 @@ function optimizeEdgeRouting(cy: Core, verticalBuses: Set<string>): void {
     upEdges.sort((a, b) => sortBySecondary(a, b, false));
     downEdges.sort((a, b) => sortBySecondary(a, b, false));
 
-    // Apply routing to each edge group
-    const applyRouting = (edgeGroup: cytoscape.EdgeSingular[], direction: string) => {
+    // Apply orthogonal taxi routing with different turn distances
+    const applyTaxiRouting = (
+      edgeGroup: cytoscape.EdgeSingular[],
+      taxiDirection: string
+    ) => {
       const numEdges = edgeGroup.length;
       if (numEdges === 0) return;
 
       edgeGroup.forEach((edge, index) => {
-        // Calculate unique channel offset for this edge
-        // Center the channels around 0: -30, -15, 0, 15, 30 for 5 edges
-        const centerIndex = (numEdges - 1) / 2;
-        const channelOffset = (index - centerIndex) * CHANNEL_SPACING;
+        // Each edge gets a different taxi-turn value to create separate channels
+        // First edge turns at BASE_TURN_DISTANCE, second at BASE + SPACING, etc.
+        const turnDistance = BASE_TURN_DISTANCE + index * CHANNEL_SPACING;
 
-        // Add minimum clearance from bus
-        const baseOffset = MIN_BUS_CLEARANCE + Math.abs(channelOffset);
-        const signedOffset = channelOffset >= 0 ? baseOffset : -baseOffset;
-
-        // Use segments curve style for 3-segment routing with unique offset
         edge.style({
-          "curve-style": "segments",
-          "segment-distances": [signedOffset, signedOffset],
-          "segment-weights": [0.1, 0.9],
+          "curve-style": "taxi",
+          "taxi-direction": taxiDirection,
+          "taxi-turn": turnDistance,
+          "taxi-turn-min-distance": 10,
         });
       });
     };
 
     // Apply routing based on source bus orientation
+    // Goal: First segment exits PERPENDICULAR to the source bus
     if (sourceIsVertical) {
-      // Vertical bus: horizontal edges need vertical offset channels
-      applyRouting(leftEdges, "left");
-      applyRouting(rightEdges, "right");
-      // Vertical edges from vertical bus - use horizontal offset
-      applyRouting(upEdges, "up");
-      applyRouting(downEdges, "down");
+      // Vertical bus: first segment should go horizontal
+      applyTaxiRouting(leftEdges, "leftward");
+      applyTaxiRouting(rightEdges, "rightward");
+      // For up/down edges from vertical bus, use horizontal-first to exit perpendicular
+      applyTaxiRouting(upEdges, "leftward");  // Go left first, then up
+      applyTaxiRouting(downEdges, "rightward");  // Go right first, then down
     } else {
-      // Horizontal bus: vertical edges need horizontal offset channels
-      applyRouting(upEdges, "up");
-      applyRouting(downEdges, "down");
-      applyRouting(leftEdges, "left");
-      applyRouting(rightEdges, "right");
+      // Horizontal bus: first segment should go vertical
+      applyTaxiRouting(upEdges, "upward");
+      applyTaxiRouting(downEdges, "downward");
+      // For left/right edges from horizontal bus, use vertical-first to exit perpendicular
+      applyTaxiRouting(leftEdges, "upward");  // Go up first, then left
+      applyTaxiRouting(rightEdges, "downward");  // Go down first, then right
     }
   });
 }
@@ -834,16 +835,17 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
             opacity: 0,  // Invisible - just connection points
           },
         },
-        // Base edge style - segments for multi-channel routing
-        // segment-distances set dynamically by optimizeEdgeRouting
+        // Base edge style - orthogonal taxi routing (90° angles only)
+        // taxi-turn set dynamically by optimizeEdgeRouting for parallel channels
         {
           selector: "edge",
           style: {
             width: 2,
             "line-color": "#34495e",
-            "curve-style": "segments",
-            "segment-distances": [25, 25],  // Default, will be overridden
-            "segment-weights": [0.1, 0.9],
+            "curve-style": "taxi",
+            "taxi-direction": "auto",
+            "taxi-turn": 40,
+            "taxi-turn-min-distance": 10,
           },
         },
         // Branch edges - transmission lines (same taxi routing)
