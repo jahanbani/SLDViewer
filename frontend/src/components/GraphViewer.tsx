@@ -419,64 +419,117 @@ function repositionEquipment(cy: Core, verticalBuses: Set<string>): void {
   });
 }
 
+// Spacing between parallel routing channels to prevent line overlap
+const CHANNEL_SPACING = 15;
+// Minimum distance from bus edge for routing
+const MIN_BUS_CLEARANCE = 25;
+
 /**
- * Optimize edge routing using taxi (orthogonal) style.
+ * Optimize edge routing to prevent overlapping and sticking to buses.
  *
- * For each edge, chooses the best taxi-direction and turn point to:
- * 1. Avoid running parallel along bus edges
- * 2. Create clean orthogonal paths
+ * Rules:
+ * 1. No line should stick to a bus (run parallel along its edge)
+ * 2. No lines should overlap for more than a few pixels
  *
- * Key insight: Use taxi-direction that makes the FIRST segment go
- * perpendicular to the source bus, creating immediate clearance.
+ * Solution: Use segment-based routing with unique perpendicular offsets
+ * for each edge, creating parallel "routing channels".
  */
 function optimizeEdgeRouting(cy: Core, verticalBuses: Set<string>): void {
-  const routedEdges = cy.edges().filter((edge) => {
+  // Group edges by their source bus to assign different channels
+  const edgesBySourceBus = new Map<string, cytoscape.EdgeSingular[]>();
+
+  cy.edges().forEach((edge) => {
     const kind = edge.data("kind");
-    return kind === "branch" || kind === "transformer_link";
+    if (kind !== "branch" && kind !== "transformer_link") return;
+
+    const sourceNode = edge.source();
+    const sourceBusId = sourceNode.data("bus_id") as string || sourceNode.id();
+
+    if (!edgesBySourceBus.has(sourceBusId)) {
+      edgesBySourceBus.set(sourceBusId, []);
+    }
+    edgesBySourceBus.get(sourceBusId)!.push(edge);
   });
 
-  routedEdges.forEach((edge) => {
-    const sourceNode = edge.source();
-    const targetNode = edge.target();
-    const sourcePos = sourceNode.position();
-    const targetPos = targetNode.position();
+  // Process edges from each bus
+  edgesBySourceBus.forEach((edges, sourceBusId) => {
+    const sourceIsVertical = verticalBuses.has(sourceBusId);
 
-    // Get the bus IDs for source and target terminals
-    const sourceBusId = sourceNode.data("bus_id") as string;
-    const targetBusId = targetNode.data("bus_id") as string;
+    // Group edges by direction (left, right, up, down relative to source)
+    const leftEdges: cytoscape.EdgeSingular[] = [];
+    const rightEdges: cytoscape.EdgeSingular[] = [];
+    const upEdges: cytoscape.EdgeSingular[] = [];
+    const downEdges: cytoscape.EdgeSingular[] = [];
 
-    // Determine if source/target buses are vertical
-    const sourceIsVertical = sourceBusId ? verticalBuses.has(sourceBusId) : true;
-    const targetIsVertical = targetBusId ? verticalBuses.has(targetBusId) : true;
+    edges.forEach((edge) => {
+      const sourcePos = edge.source().position();
+      const targetPos = edge.target().position();
+      const dx = targetPos.x - sourcePos.x;
+      const dy = targetPos.y - sourcePos.y;
 
-    const dx = targetPos.x - sourcePos.x;
-    const dy = targetPos.y - sourcePos.y;
-
-    // Choose taxi-direction based on source bus orientation
-    // Goal: First segment should exit PERPENDICULAR to the source bus
-    let direction: string;
-    let turnDistance: number;
-
-    if (sourceIsVertical) {
-      // Source is vertical bus - first segment should go HORIZONTAL (left/right)
-      // This means taxi-direction should be "horizontal" (horizontal first, then vertical)
-      direction = dx > 0 ? "rightward" : "leftward";
-      // Turn near the target to create more clearance at source
-      turnDistance = -40; // Negative = turn 40px before target
-    } else {
-      // Source is horizontal bus - first segment should go VERTICAL (up/down)
-      // This means taxi-direction should be "vertical" (vertical first, then horizontal)
-      direction = dy > 0 ? "downward" : "upward";
-      // Turn near the target to create more clearance at source
-      turnDistance = -40;
-    }
-
-    edge.style({
-      "curve-style": "taxi",
-      "taxi-direction": direction,
-      "taxi-turn": turnDistance,
-      "taxi-turn-min-distance": 20,
+      // Categorize by primary direction
+      if (Math.abs(dx) > Math.abs(dy)) {
+        // Primarily horizontal
+        if (dx > 0) rightEdges.push(edge);
+        else leftEdges.push(edge);
+      } else {
+        // Primarily vertical
+        if (dy > 0) downEdges.push(edge);
+        else upEdges.push(edge);
+      }
     });
+
+    // Sort edges in each group by their secondary axis to create consistent channel assignment
+    const sortBySecondary = (a: cytoscape.EdgeSingular, b: cytoscape.EdgeSingular, useY: boolean) => {
+      const aTarget = a.target().position();
+      const bTarget = b.target().position();
+      return useY ? aTarget.y - bTarget.y : aTarget.x - bTarget.x;
+    };
+
+    leftEdges.sort((a, b) => sortBySecondary(a, b, true));
+    rightEdges.sort((a, b) => sortBySecondary(a, b, true));
+    upEdges.sort((a, b) => sortBySecondary(a, b, false));
+    downEdges.sort((a, b) => sortBySecondary(a, b, false));
+
+    // Apply routing to each edge group
+    const applyRouting = (edgeGroup: cytoscape.EdgeSingular[], direction: string) => {
+      const numEdges = edgeGroup.length;
+      if (numEdges === 0) return;
+
+      edgeGroup.forEach((edge, index) => {
+        // Calculate unique channel offset for this edge
+        // Center the channels around 0: -30, -15, 0, 15, 30 for 5 edges
+        const centerIndex = (numEdges - 1) / 2;
+        const channelOffset = (index - centerIndex) * CHANNEL_SPACING;
+
+        // Add minimum clearance from bus
+        const baseOffset = MIN_BUS_CLEARANCE + Math.abs(channelOffset);
+        const signedOffset = channelOffset >= 0 ? baseOffset : -baseOffset;
+
+        // Use segments curve style for 3-segment routing with unique offset
+        edge.style({
+          "curve-style": "segments",
+          "segment-distances": [signedOffset, signedOffset],
+          "segment-weights": [0.1, 0.9],
+        });
+      });
+    };
+
+    // Apply routing based on source bus orientation
+    if (sourceIsVertical) {
+      // Vertical bus: horizontal edges need vertical offset channels
+      applyRouting(leftEdges, "left");
+      applyRouting(rightEdges, "right");
+      // Vertical edges from vertical bus - use horizontal offset
+      applyRouting(upEdges, "up");
+      applyRouting(downEdges, "down");
+    } else {
+      // Horizontal bus: vertical edges need horizontal offset channels
+      applyRouting(upEdges, "up");
+      applyRouting(downEdges, "down");
+      applyRouting(leftEdges, "left");
+      applyRouting(rightEdges, "right");
+    }
   });
 }
 
@@ -781,17 +834,16 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
             opacity: 0,  // Invisible - just connection points
           },
         },
-        // Base edge style - orthogonal (taxi) routing
-        // Direction and turn set dynamically by optimizeEdgeRouting
+        // Base edge style - segments for multi-channel routing
+        // segment-distances set dynamically by optimizeEdgeRouting
         {
           selector: "edge",
           style: {
             width: 2,
             "line-color": "#34495e",
-            "curve-style": "taxi",
-            "taxi-direction": "auto",
-            "taxi-turn": -40,
-            "taxi-turn-min-distance": 20,
+            "curve-style": "segments",
+            "segment-distances": [25, 25],  // Default, will be overridden
+            "segment-weights": [0.1, 0.9],
           },
         },
         // Branch edges - transmission lines (same taxi routing)
