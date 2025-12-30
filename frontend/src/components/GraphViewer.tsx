@@ -420,107 +420,63 @@ function repositionEquipment(cy: Core, verticalBuses: Set<string>): void {
 }
 
 /**
- * Check if a line segment intersects with a rectangle (node bounding box).
+ * Optimize edge routing using taxi (orthogonal) style.
+ *
+ * For each edge, chooses the best taxi-direction and turn point to:
+ * 1. Avoid running parallel along bus edges
+ * 2. Create clean orthogonal paths
+ *
+ * Key insight: Use taxi-direction that makes the FIRST segment go
+ * perpendicular to the source bus, creating immediate clearance.
  */
-function lineIntersectsRect(
-  x1: number, y1: number, x2: number, y2: number,
-  cx: number, cy: number, hw: number, hh: number
-): boolean {
-  const left = cx - hw;
-  const right = cx + hw;
-  const top = cy - hh;
-  const bottom = cy + hh;
-
-  const p1Inside = x1 >= left && x1 <= right && y1 >= top && y1 <= bottom;
-  const p2Inside = x2 >= left && x2 <= right && y2 >= top && y2 <= bottom;
-  if (p1Inside || p2Inside) return true;
-
-  if (x1 === x2) {
-    const minY = Math.min(y1, y2);
-    const maxY = Math.max(y1, y2);
-    return x1 >= left && x1 <= right && minY <= bottom && maxY >= top;
-  }
-  if (y1 === y2) {
-    const minX = Math.min(x1, x2);
-    const maxX = Math.max(x1, x2);
-    return y1 >= top && y1 <= bottom && minX <= right && maxX >= left;
-  }
-  return false;
-}
-
-/**
- * Count how many nodes a taxi-routed edge would collide with.
- */
-function countTaxiCollisions(
-  sourcePos: { x: number; y: number },
-  targetPos: { x: number; y: number },
-  direction: "horizontal" | "vertical",
-  nodes: NodeSingular[],
-  excludeIds: Set<string>
-): number {
-  let collisions = 0;
-  let seg1End: { x: number; y: number };
-
-  if (direction === "horizontal") {
-    seg1End = { x: targetPos.x, y: sourcePos.y };
-  } else {
-    seg1End = { x: sourcePos.x, y: targetPos.y };
-  }
-
-  for (const node of nodes) {
-    if (excludeIds.has(node.id())) continue;
-    const pos = node.position();
-    const w = node.outerWidth() / 2;
-    const h = node.outerHeight() / 2;
-
-    if (
-      lineIntersectsRect(sourcePos.x, sourcePos.y, seg1End.x, seg1End.y, pos.x, pos.y, w, h) ||
-      lineIntersectsRect(seg1End.x, seg1End.y, targetPos.x, targetPos.y, pos.x, pos.y, w, h)
-    ) {
-      collisions++;
-    }
-  }
-  return collisions;
-}
-
-/**
- * Optimize edge routing by choosing the best taxi-direction for each edge
- * to minimize collisions with nodes.
- */
-function optimizeEdgeRouting(cy: Core): void {
-  const collidableNodes = cy.nodes().filter((node) => {
-    const kind = node.data("kind");
-    return kind === "bus" || kind === "transformer" || kind === "substation" || kind === "neighbor_substation_stub" || kind === "equipment";
-  }).toArray() as NodeSingular[];
-
-  const taxiEdges = cy.edges().filter((edge) => {
+function optimizeEdgeRouting(cy: Core, verticalBuses: Set<string>): void {
+  const routedEdges = cy.edges().filter((edge) => {
     const kind = edge.data("kind");
     return kind === "branch" || kind === "transformer_link";
   });
 
-  taxiEdges.forEach((edge) => {
+  routedEdges.forEach((edge) => {
     const sourceNode = edge.source();
     const targetNode = edge.target();
     const sourcePos = sourceNode.position();
     const targetPos = targetNode.position();
 
-    const excludeIds = new Set<string>([sourceNode.id(), targetNode.id()]);
-    const sourceBusId = sourceNode.data("bus_id");
-    const targetBusId = targetNode.data("bus_id");
-    if (sourceBusId) excludeIds.add(sourceBusId);
-    if (targetBusId) excludeIds.add(targetBusId);
+    // Get the bus IDs for source and target terminals
+    const sourceBusId = sourceNode.data("bus_id") as string;
+    const targetBusId = targetNode.data("bus_id") as string;
 
-    const horizontalCollisions = countTaxiCollisions(sourcePos, targetPos, "horizontal", collidableNodes, excludeIds);
-    const verticalCollisions = countTaxiCollisions(sourcePos, targetPos, "vertical", collidableNodes, excludeIds);
+    // Determine if source/target buses are vertical
+    const sourceIsVertical = sourceBusId ? verticalBuses.has(sourceBusId) : true;
+    const targetIsVertical = targetBusId ? verticalBuses.has(targetBusId) : true;
 
-    let bestDirection: "horizontal" | "vertical" | "auto" = "auto";
-    if (horizontalCollisions < verticalCollisions) {
-      bestDirection = "horizontal";
-    } else if (verticalCollisions < horizontalCollisions) {
-      bestDirection = "vertical";
+    const dx = targetPos.x - sourcePos.x;
+    const dy = targetPos.y - sourcePos.y;
+
+    // Choose taxi-direction based on source bus orientation
+    // Goal: First segment should exit PERPENDICULAR to the source bus
+    let direction: string;
+    let turnDistance: number;
+
+    if (sourceIsVertical) {
+      // Source is vertical bus - first segment should go HORIZONTAL (left/right)
+      // This means taxi-direction should be "horizontal" (horizontal first, then vertical)
+      direction = dx > 0 ? "rightward" : "leftward";
+      // Turn near the target to create more clearance at source
+      turnDistance = -40; // Negative = turn 40px before target
+    } else {
+      // Source is horizontal bus - first segment should go VERTICAL (up/down)
+      // This means taxi-direction should be "vertical" (vertical first, then horizontal)
+      direction = dy > 0 ? "downward" : "upward";
+      // Turn near the target to create more clearance at source
+      turnDistance = -40;
     }
 
-    edge.style("taxi-direction", bestDirection);
+    edge.style({
+      "curve-style": "taxi",
+      "taxi-direction": direction,
+      "taxi-turn": turnDistance,
+      "taxi-turn-min-distance": 20,
+    });
   });
 }
 
@@ -825,7 +781,8 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
             opacity: 0,  // Invisible - just connection points
           },
         },
-        // Base edge style - orthogonal (taxi) routing like PSS/E
+        // Base edge style - orthogonal (taxi) routing
+        // Direction and turn set dynamically by optimizeEdgeRouting
         {
           selector: "edge",
           style: {
@@ -833,8 +790,8 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
             "line-color": "#34495e",
             "curve-style": "taxi",
             "taxi-direction": "auto",
-            "taxi-turn": "50%",
-            "taxi-turn-min-distance": 5,
+            "taxi-turn": -40,
+            "taxi-turn-min-distance": 20,
           },
         },
         // Branch edges - transmission lines (same taxi routing)
@@ -933,8 +890,8 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
 
     // Reposition equipment nodes to be close to their parent bus
     repositionEquipment(cy, verticalBuses);
-    // Optimize edge routing to avoid crossing through nodes
-    optimizeEdgeRouting(cy);
+    // Optimize edge routing based on bus orientations
+    optimizeEdgeRouting(cy, verticalBuses);
 
     // Add drag listener: when bus is dragged, move equipment and terminals with it
     cy.on("drag", "node[kind='bus']", (evt) => {
@@ -1124,7 +1081,7 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
     if (cyRef.current) {
       repositionTerminals(cyRef.current, verticalBuses);
       repositionEquipment(cyRef.current, verticalBuses);
-      optimizeEdgeRouting(cyRef.current);
+      optimizeEdgeRouting(cyRef.current, verticalBuses);
     }
   }, [verticalBuses]);
 
