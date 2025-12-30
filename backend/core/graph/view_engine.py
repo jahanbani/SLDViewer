@@ -112,6 +112,7 @@ def _view_bus_mode(graph: GraphHandle, spec: ViewSpec, settings: Settings) -> Vi
         "substation_count": len(substations),
         "degrees": spec.degrees,
         "limit": node_limit,
+        "center_bus_numbers": spec.center_bus_numbers or [],  # For layout algorithm
     }
 
     return ViewResult(
