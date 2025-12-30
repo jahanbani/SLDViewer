@@ -1,0 +1,301 @@
+/**
+ * Alignment Detector
+ *
+ * Detects center and edge alignments between nodes.
+ * This is the primary detector for PowerPoint-style smart guides.
+ */
+
+import type { Core, NodeSingular, Position } from "cytoscape";
+import type {
+  IAlignmentDetector,
+  AlignmentMatch,
+  Guide,
+  GuidelineConfig,
+  GuideType,
+} from "../types";
+
+/**
+ * Bounding box representation for a node.
+ */
+interface NodeBounds {
+  id: string;
+  centerX: number;
+  centerY: number;
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Get the bounding box for a node.
+ */
+function getNodeBounds(node: NodeSingular, position?: Position): NodeBounds {
+  const pos = position || node.position();
+  const width = node.outerWidth();
+  const height = node.outerHeight();
+
+  return {
+    id: node.id(),
+    centerX: pos.x,
+    centerY: pos.y,
+    left: pos.x - width / 2,
+    right: pos.x + width / 2,
+    top: pos.y - height / 2,
+    bottom: pos.y + height / 2,
+    width,
+    height,
+  };
+}
+
+/**
+ * Create a unique guide ID.
+ */
+function createGuideId(type: GuideType, sourceId: string, position: number): string {
+  return `${type}-${sourceId}-${Math.round(position)}`;
+}
+
+/**
+ * AlignmentDetector - Detects center and edge alignments.
+ */
+export class AlignmentDetector implements IAlignmentDetector {
+  readonly name = "alignment";
+
+  /**
+   * Detect alignments for a dragged node against all other visible nodes.
+   */
+  detect(
+    cy: Core,
+    draggedNode: NodeSingular,
+    currentPosition: Position,
+    config: GuidelineConfig
+  ): AlignmentMatch[] {
+    const matches: AlignmentMatch[] = [];
+    const draggedBounds = getNodeBounds(draggedNode, currentPosition);
+    const threshold = config.showThreshold;
+
+    // Get all candidate nodes (excluding dragged node and excluded kinds)
+    const candidateNodes = cy.nodes().filter((node) => {
+      if (node.id() === draggedNode.id()) return false;
+      const kind = node.data("kind") as string;
+      if (config.excludeNodeKinds.includes(kind)) return false;
+      // Only consider visible nodes
+      if (!node.visible()) return false;
+      return true;
+    });
+
+    // Check alignment against each candidate node
+    candidateNodes.forEach((candidateNode) => {
+      const candidateBounds = getNodeBounds(candidateNode);
+
+      // Center alignments
+      if (config.alignments.centerAlignment) {
+        // Vertical center alignment (X axis)
+        const xCenterDiff = Math.abs(draggedBounds.centerX - candidateBounds.centerX);
+        if (xCenterDiff <= threshold) {
+          matches.push(this.createMatch(
+            "center-x",
+            "vertical",
+            candidateBounds.centerX,
+            candidateNode.id(),
+            xCenterDiff,
+            { x: candidateBounds.centerX, y: currentPosition.y },
+            "x"
+          ));
+        }
+
+        // Horizontal center alignment (Y axis)
+        const yCenterDiff = Math.abs(draggedBounds.centerY - candidateBounds.centerY);
+        if (yCenterDiff <= threshold) {
+          matches.push(this.createMatch(
+            "center-y",
+            "horizontal",
+            candidateBounds.centerY,
+            candidateNode.id(),
+            yCenterDiff,
+            { x: currentPosition.x, y: candidateBounds.centerY },
+            "y"
+          ));
+        }
+      }
+
+      // Edge alignments
+      if (config.alignments.edgeAlignment) {
+        // Left edge alignments
+        const leftToLeftDiff = Math.abs(draggedBounds.left - candidateBounds.left);
+        if (leftToLeftDiff <= threshold) {
+          const snapX = candidateBounds.left + draggedBounds.width / 2;
+          matches.push(this.createMatch(
+            "edge-left",
+            "vertical",
+            candidateBounds.left,
+            candidateNode.id(),
+            leftToLeftDiff,
+            { x: snapX, y: currentPosition.y },
+            "x"
+          ));
+        }
+
+        const leftToRightDiff = Math.abs(draggedBounds.left - candidateBounds.right);
+        if (leftToRightDiff <= threshold) {
+          const snapX = candidateBounds.right + draggedBounds.width / 2;
+          matches.push(this.createMatch(
+            "edge-left",
+            "vertical",
+            candidateBounds.right,
+            candidateNode.id(),
+            leftToRightDiff,
+            { x: snapX, y: currentPosition.y },
+            "x"
+          ));
+        }
+
+        // Right edge alignments
+        const rightToRightDiff = Math.abs(draggedBounds.right - candidateBounds.right);
+        if (rightToRightDiff <= threshold) {
+          const snapX = candidateBounds.right - draggedBounds.width / 2;
+          matches.push(this.createMatch(
+            "edge-right",
+            "vertical",
+            candidateBounds.right,
+            candidateNode.id(),
+            rightToRightDiff,
+            { x: snapX, y: currentPosition.y },
+            "x"
+          ));
+        }
+
+        const rightToLeftDiff = Math.abs(draggedBounds.right - candidateBounds.left);
+        if (rightToLeftDiff <= threshold) {
+          const snapX = candidateBounds.left - draggedBounds.width / 2;
+          matches.push(this.createMatch(
+            "edge-right",
+            "vertical",
+            candidateBounds.left,
+            candidateNode.id(),
+            rightToLeftDiff,
+            { x: snapX, y: currentPosition.y },
+            "x"
+          ));
+        }
+
+        // Top edge alignments
+        const topToTopDiff = Math.abs(draggedBounds.top - candidateBounds.top);
+        if (topToTopDiff <= threshold) {
+          const snapY = candidateBounds.top + draggedBounds.height / 2;
+          matches.push(this.createMatch(
+            "edge-top",
+            "horizontal",
+            candidateBounds.top,
+            candidateNode.id(),
+            topToTopDiff,
+            { x: currentPosition.x, y: snapY },
+            "y"
+          ));
+        }
+
+        const topToBottomDiff = Math.abs(draggedBounds.top - candidateBounds.bottom);
+        if (topToBottomDiff <= threshold) {
+          const snapY = candidateBounds.bottom + draggedBounds.height / 2;
+          matches.push(this.createMatch(
+            "edge-top",
+            "horizontal",
+            candidateBounds.bottom,
+            candidateNode.id(),
+            topToBottomDiff,
+            { x: currentPosition.x, y: snapY },
+            "y"
+          ));
+        }
+
+        // Bottom edge alignments
+        const bottomToBottomDiff = Math.abs(draggedBounds.bottom - candidateBounds.bottom);
+        if (bottomToBottomDiff <= threshold) {
+          const snapY = candidateBounds.bottom - draggedBounds.height / 2;
+          matches.push(this.createMatch(
+            "edge-bottom",
+            "horizontal",
+            candidateBounds.bottom,
+            candidateNode.id(),
+            bottomToBottomDiff,
+            { x: currentPosition.x, y: snapY },
+            "y"
+          ));
+        }
+
+        const bottomToTopDiff = Math.abs(draggedBounds.bottom - candidateBounds.top);
+        if (bottomToTopDiff <= threshold) {
+          const snapY = candidateBounds.top - draggedBounds.height / 2;
+          matches.push(this.createMatch(
+            "edge-bottom",
+            "horizontal",
+            candidateBounds.top,
+            candidateNode.id(),
+            bottomToTopDiff,
+            { x: currentPosition.x, y: snapY },
+            "y"
+          ));
+        }
+      }
+    });
+
+    // Sort by distance (closest first) and deduplicate by position
+    return this.deduplicateMatches(matches);
+  }
+
+  /**
+   * Create an alignment match object.
+   */
+  private createMatch(
+    type: GuideType,
+    orientation: "horizontal" | "vertical",
+    position: number,
+    sourceNodeId: string,
+    distance: number,
+    snapPosition: Position,
+    axis: "x" | "y"
+  ): AlignmentMatch {
+    const guide: Guide = {
+      id: createGuideId(type, sourceNodeId, position),
+      type,
+      orientation,
+      position,
+      sourceNodeId,
+      visible: true,
+      priority: type.startsWith("center") ? 10 : 5, // Center alignments have higher priority
+    };
+
+    return {
+      guide,
+      distance,
+      snapPosition,
+      axis,
+    };
+  }
+
+  /**
+   * Remove duplicate matches at the same position, keeping the closest one.
+   */
+  private deduplicateMatches(matches: AlignmentMatch[]): AlignmentMatch[] {
+    // Sort by distance
+    matches.sort((a, b) => a.distance - b.distance);
+
+    // Deduplicate by position (rounded to 1 pixel)
+    const seen = new Map<string, AlignmentMatch>();
+
+    for (const match of matches) {
+      const key = `${match.guide.orientation}-${Math.round(match.guide.position)}`;
+      if (!seen.has(key)) {
+        seen.set(key, match);
+      }
+    }
+
+    return Array.from(seen.values());
+  }
+
+  destroy(): void {
+    // No cleanup needed
+  }
+}

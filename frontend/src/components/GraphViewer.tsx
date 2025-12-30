@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import cytoscape, { Core, NodeSingular, EdgeSingular } from "cytoscape";
+import { GuidelineManager } from "../features/guidelines";
 
 // API base URL - uses Vite proxy in development, env vars in production
 const API_BASE_URL = import.meta.env.VITE_API_URL || "";
@@ -533,6 +534,8 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
   const [showSubstationGroups, setShowSubstationGroups] = useState<boolean>(true);
   const [selectedElement, setSelectedElement] = useState<NodeData | EdgeData | null>(null);
   const [verticalBuses, setVerticalBuses] = useState<Set<string>>(new Set());
+  const [showGuidelines, setShowGuidelines] = useState<boolean>(true);
+  const guidelinesRef = useRef<GuidelineManager | null>(null);
 
   // Use a ref for position caching to avoid triggering re-renders
   const cachedPositionsRef = useRef<Record<string, { x: number; y: number }>>({});
@@ -618,6 +621,11 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
         const pos = node.position();
         cachedPositionsRef.current[node.id()] = { x: pos.x, y: pos.y };
       });
+      // Clean up guidelines manager
+      if (guidelinesRef.current) {
+        guidelinesRef.current.destroy();
+        guidelinesRef.current = null;
+      }
       cyRef.current.destroy();
     }
 
@@ -921,6 +929,14 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
 
     // Store reference
     cyRef.current = cy;
+    if (containerRef.current) {
+      guidelinesRef.current = new GuidelineManager(cy, containerRef.current, {
+        enabled: true,
+        snapEnabled: true,
+        snapThreshold: 8,
+        showThreshold: 15,
+      });
+    }
 
     // Make terminal nodes non-grabbable (they move with their bus)
     cy.nodes("[kind='terminal']").ungrabify();
@@ -951,19 +967,36 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
     // Optimize edge routing to avoid crossing through nodes
     optimizeEdgeRouting(cy);
 
+    // Grab handler for guidelines - notify when drag starts
+    cy.on("grab", "node[kind='bus']", (evt) => {
+      const bus = evt.target as NodeSingular;
+      if (guidelinesRef.current) {
+        guidelinesRef.current.onDragStart(bus);
+      }
+    });
+
     // Add drag listener: when bus is dragged, move equipment and terminals with it
     cy.on("drag", "node[kind='bus']", (evt) => {
       const bus = evt.target;
       const busId = bus.id();
       const busPos = bus.position();
+      // Check guidelines for snapping
+      let finalPos = busPos;
+      if (guidelinesRef.current) {
+        const snappedPos = guidelinesRef.current.onDrag(bus as NodeSingular, busPos);
+        if (snappedPos.x !== busPos.x || snappedPos.y !== busPos.y) {
+          bus.position(snappedPos);
+          finalPos = snappedPos;
+        }
+      }
 
       // Move all terminals attached to this bus
       cy.nodes("[kind='terminal']").forEach((termNode) => {
         if (termNode.data("bus_id") === busId) {
           const offset = termNode.scratch("_busOffset") || { x: 0, y: 0 };
           termNode.position({
-            x: busPos.x + offset.x,
-            y: busPos.y + offset.y,
+            x: finalPos.x + offset.x,
+            y: finalPos.y + offset.y,
           });
         }
       });
@@ -973,11 +1006,22 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
         if (eqNode.data("bus_id") === busId) {
           const offset = eqNode.scratch("_offset") || { x: 0, y: 60 };
           eqNode.position({
-            x: busPos.x + offset.x,
-            y: busPos.y + offset.y,
+            x: finalPos.x + offset.x,
+            y: finalPos.y + offset.y,
           });
         }
       });
+    });
+
+    // Free handler for guidelines - notify when drag ends
+    cy.on("free", "node[kind='bus']", (evt) => {
+      const bus = evt.target as NodeSingular;
+      if (guidelinesRef.current) {
+        guidelinesRef.current.onDragEnd(bus);
+      }
+      // Re-run terminal positioning and edge routing after drag
+      repositionTerminals(cy, verticalBuses);
+      optimizeEdgeRouting(cy);
     });
 
     // Node click handler (single click = select)
@@ -1040,6 +1084,11 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
     // Cleanup on unmount
     return () => {
       if (cyRef.current) {
+      // Clean up guidelines manager
+      if (guidelinesRef.current) {
+        guidelinesRef.current.destroy();
+        guidelinesRef.current = null;
+      }
         cyRef.current.destroy();
         cyRef.current = null;
       }
@@ -1241,6 +1290,23 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
               onChange={(e) => setShowSubstationGroups(e.target.checked)}
             />
             Substations
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+            <input
+              type="checkbox"
+              checked={showGuidelines}
+              onChange={(e) => {
+                setShowGuidelines(e.target.checked);
+                if (guidelinesRef.current) {
+                  if (e.target.checked) {
+                    guidelinesRef.current.enable();
+                  } else {
+                    guidelinesRef.current.disable();
+                  }
+                }
+              }}
+            />
+            Guidelines
           </label>
           <button
             onClick={() => setCenterBus(null)}
