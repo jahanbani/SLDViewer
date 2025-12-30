@@ -153,7 +153,7 @@ def _position_buses_2d(
     if center_id in bus_order:
         positions[center_id] = {"x": center_x, "y": center_y}
 
-    # Separate direct neighbors from distant buses
+    # Separate buses into categories
     direct_neighbors = []
     distant_buses = []
 
@@ -165,27 +165,39 @@ def _position_buses_2d(
         else:
             distant_buses.append(bus_id)
 
-    # Position direct neighbors: alternate left/right on same row
-    left_count = 0
-    right_count = 0
+    # Position first 2 direct neighbors: left and right of center
+    # Additional neighbors go BELOW center to avoid crossings
+    horizontal_neighbors = direct_neighbors[:2]  # Max 2 on horizontal
+    vertical_neighbors = direct_neighbors[2:]    # Rest go below
 
-    for i, bus_id in enumerate(direct_neighbors):
-        if i % 2 == 0:
-            right_count += 1
-            positions[bus_id] = {
-                "x": center_x + right_count * BUS_SPACING,
-                "y": center_y,
-            }
-        else:
-            left_count += 1
-            positions[bus_id] = {
-                "x": center_x - left_count * BUS_SPACING,
-                "y": center_y,
-            }
+    # First neighbor goes right, second goes left
+    if len(horizontal_neighbors) >= 1:
+        positions[horizontal_neighbors[0]] = {
+            "x": center_x + BUS_SPACING,
+            "y": center_y,
+        }
+    if len(horizontal_neighbors) >= 2:
+        positions[horizontal_neighbors[1]] = {
+            "x": center_x - BUS_SPACING,
+            "y": center_y,
+        }
+
+    # Additional direct neighbors go below center
+    row_offset = BUS_SPACING
+    for i, bus_id in enumerate(vertical_neighbors):
+        positions[bus_id] = {
+            "x": center_x,
+            "y": center_y + row_offset * (i + 1),
+        }
 
     # Position distant buses: place below their connected neighbor
-    row_offset = BUS_SPACING  # Vertical spacing for lower rows
     placed_in_column: dict[float, int] = {}  # x -> count of buses in that column
+
+    # Initialize column counts for already placed buses
+    for bus_id, pos in positions.items():
+        x = pos["x"]
+        if pos["y"] > center_y:  # Already below main row
+            placed_in_column[x] = placed_in_column.get(x, 0) + 1
 
     for bus_id in distant_buses:
         # Find which positioned bus this one connects to
@@ -209,11 +221,12 @@ def _position_buses_2d(
                 "y": center_y + row_offset * (col_count + 1),
             }
         else:
-            # No connection found - place at end of main row
-            right_count += 1
+            # No connection found - place below center
+            col_count = placed_in_column.get(center_x, 0)
+            placed_in_column[center_x] = col_count + 1
             positions[bus_id] = {
-                "x": center_x + right_count * BUS_SPACING,
-                "y": center_y,
+                "x": center_x,
+                "y": center_y + row_offset * (col_count + 1),
             }
 
     return positions
