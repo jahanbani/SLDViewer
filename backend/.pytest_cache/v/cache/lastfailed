@@ -1,0 +1,6 @@
+{
+  "tests/test_cytoscape_converter.py": true,
+  "tests/test_graph_builder.py": true,
+  "tests/test_rawx_parser.py": true,
+  "tests/test_view_engine.py": true
+}
