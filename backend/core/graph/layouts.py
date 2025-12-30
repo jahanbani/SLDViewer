@@ -4,27 +4,27 @@ Computes node positions for graph visualization.
 """
 
 from collections import defaultdict
-from typing import Any
 
 from backend.core.graph.models import ViewResult, BusModel, BranchModel
 
 
 # Layout constants
-SUBSTATION_SPACING = 300  # Horizontal spacing between substations
-BUS_SPACING = 80  # Vertical spacing between buses within a substation
-EQUIPMENT_OFFSET = 50  # Distance from bus to equipment
+BUS_SPACING = 200  # Horizontal spacing between buses
+EQUIPMENT_OFFSET = 60  # Distance from bus to equipment (below)
+EQUIPMENT_SPACING = 35  # Horizontal spacing between equipment items
 TRANSFORMER_OFFSET = 40  # Distance from bus to transformer
+BUS_Y = 100  # Y position for all buses (same horizontal line)
 
 
 def compute_substation_layout(result: ViewResult) -> dict[str, dict[str, float]]:
-    """Compute positions for all nodes using substation-based layout.
+    """Compute positions for all nodes using horizontal bus layout.
 
     Layout strategy:
-    1. Group buses by substation
-    2. Arrange substations horizontally (left to right)
-    3. Stack buses vertically within each substation
-    4. Position transformers between their connected buses
-    5. Position equipment offset from their parent bus
+    1. Place center bus in the middle
+    2. Spread connected buses left and right using BFS
+    3. All buses on the SAME horizontal line
+    4. Equipment positioned BELOW their parent bus
+    5. Transformers between connected buses
 
     Args:
         result: ViewResult containing buses, branches, equipment, substations
@@ -34,65 +34,34 @@ def compute_substation_layout(result: ViewResult) -> dict[str, dict[str, float]]
     """
     positions: dict[str, dict[str, float]] = {}
 
-    # Group buses by substation
-    buses_by_substation: dict[str | None, list[BusModel]] = defaultdict(list)
-    for bus in result.buses:
-        buses_by_substation[bus.substation_id].append(bus)
+    if not result.buses:
+        return positions
 
-    # Sort buses within each substation by voltage (highest first)
-    for sub_id in buses_by_substation:
-        buses_by_substation[sub_id].sort(key=lambda b: -b.base_kv)
+    # Build adjacency list for BFS ordering
+    adjacency: dict[str, list[str]] = defaultdict(list)
+    for branch in result.branches:
+        adjacency[branch.from_bus_id].append(branch.to_bus_id)
+        adjacency[branch.to_bus_id].append(branch.from_bus_id)
 
-    # Get ordered list of substations (by number of buses, then name)
-    substation_order = _order_substations(result, buses_by_substation)
+    # Find center bus (from metadata or most connected)
+    center_bus_id = _find_center_bus(result, adjacency)
 
-    # Position substations and their buses
-    current_x = 0
-    substation_positions: dict[str | None, dict[str, float]] = {}
-    bus_positions: dict[str, dict[str, float]] = {}
+    # BFS to order buses by distance from center
+    bus_order = _bfs_order_buses(center_bus_id, adjacency, result.buses)
 
-    for sub_id in substation_order:
-        buses = buses_by_substation.get(sub_id, [])
-        if not buses:
-            continue
+    # Position buses on horizontal line, center bus in middle
+    bus_positions = _position_buses_horizontal(bus_order, center_bus_id)
+    positions.update(bus_positions)
 
-        # Calculate substation width based on number of buses
-        sub_height = len(buses) * BUS_SPACING
-        sub_center_y = sub_height / 2
-
-        # Position substation group node
-        if sub_id:
-            substation_positions[sub_id] = {
-                "x": current_x + SUBSTATION_SPACING / 2,
-                "y": sub_center_y,
-            }
-            positions[sub_id] = substation_positions[sub_id]
-
-        # Position buses within substation (stacked vertically)
-        for i, bus in enumerate(buses):
-            bus_y = i * BUS_SPACING + BUS_SPACING / 2
-            bus_positions[bus.id] = {
-                "x": current_x + SUBSTATION_SPACING / 2,
-                "y": bus_y,
-            }
-            positions[bus.id] = bus_positions[bus.id]
-
-        current_x += SUBSTATION_SPACING
-
-    # Handle buses without substation (place them at the end)
-    orphan_buses = buses_by_substation.get(None, [])
-    for i, bus in enumerate(orphan_buses):
-        bus_positions[bus.id] = {
-            "x": current_x + SUBSTATION_SPACING / 2,
-            "y": i * BUS_SPACING + BUS_SPACING / 2,
-        }
-        positions[bus.id] = bus_positions[bus.id]
+    # Position substation groups around their buses
+    substation_positions = _position_substations(result, bus_positions)
+    positions.update(substation_positions)
 
     # Position transformers (between their connected buses)
     transformer_positions = _position_transformers(result.branches, bus_positions)
     positions.update(transformer_positions)
 
-    # Position equipment (offset from their parent bus)
+    # Position equipment BELOW their parent bus
     equipment_positions = _position_equipment(result, bus_positions)
     positions.update(equipment_positions)
 
@@ -103,40 +72,131 @@ def compute_substation_layout(result: ViewResult) -> dict[str, dict[str, float]]
     return positions
 
 
-def _order_substations(
-    result: ViewResult,
-    buses_by_substation: dict[str | None, list[BusModel]],
-) -> list[str | None]:
-    """Determine the order of substations for layout.
+def _find_center_bus(result: ViewResult, adjacency: dict[str, list[str]]) -> str:
+    """Find the center bus for layout.
 
-    Uses a simple heuristic: order by connectivity (most connected first),
-    then by name alphabetically.
+    Uses center_bus from metadata if available, otherwise picks
+    the most connected bus.
     """
-    # Count connections between substations
-    substation_connections: dict[str | None, int] = defaultdict(int)
-    bus_to_sub: dict[str, str | None] = {b.id: b.substation_id for b in result.buses}
+    # Check metadata for center bus numbers
+    center_numbers = result.meta.get("center_bus_numbers", [])
+    if center_numbers:
+        # Find bus with matching psse_number
+        for bus in result.buses:
+            if bus.psse_number in center_numbers:
+                return bus.id
 
-    for branch in result.branches:
-        from_sub = bus_to_sub.get(branch.from_bus_id)
-        to_sub = bus_to_sub.get(branch.to_bus_id)
-        if from_sub != to_sub:  # Inter-substation connection
-            substation_connections[from_sub] += 1
-            substation_connections[to_sub] += 1
+    # Fallback: most connected bus
+    if result.buses:
+        return max(result.buses, key=lambda b: len(adjacency.get(b.id, []))).id
 
-    # Get substation names for sorting
-    sub_names: dict[str | None, str] = {None: "zzz_orphan"}
-    for sub in result.substations:
-        sub_names[sub.id] = sub.name
+    return result.buses[0].id if result.buses else ""
 
-    # Sort: most connected first, then alphabetically
-    sub_ids = list(buses_by_substation.keys())
-    sub_ids.sort(key=lambda s: (-substation_connections.get(s, 0), sub_names.get(s, "")))
 
-    # Remove None (orphans) from main list - they go at end
-    if None in sub_ids:
-        sub_ids.remove(None)
+def _bfs_order_buses(
+    center_id: str,
+    adjacency: dict[str, list[str]],
+    buses: list[BusModel],
+) -> list[str]:
+    """Order buses using BFS from center, alternating left/right."""
+    bus_ids = {b.id for b in buses}
+    visited = set()
+    order = []
 
-    return sub_ids
+    # BFS from center
+    queue = [center_id] if center_id in bus_ids else []
+    while queue:
+        bus_id = queue.pop(0)
+        if bus_id in visited or bus_id not in bus_ids:
+            continue
+        visited.add(bus_id)
+        order.append(bus_id)
+
+        # Add neighbors
+        for neighbor in adjacency.get(bus_id, []):
+            if neighbor not in visited and neighbor in bus_ids:
+                queue.append(neighbor)
+
+    # Add any disconnected buses
+    for bus in buses:
+        if bus.id not in visited:
+            order.append(bus.id)
+
+    return order
+
+
+def _position_buses_horizontal(
+    bus_order: list[str],
+    center_id: str,
+) -> dict[str, dict[str, float]]:
+    """Position buses on a horizontal line, center bus in middle."""
+    positions: dict[str, dict[str, float]] = {}
+
+    if not bus_order:
+        return positions
+
+    # Find center index
+    try:
+        center_idx = bus_order.index(center_id)
+    except ValueError:
+        center_idx = 0
+
+    # Position center at x=0
+    center_x = len(bus_order) * BUS_SPACING / 2
+
+    # Assign positions: center bus first, then alternate left/right
+    left_buses = bus_order[:center_idx]
+    right_buses = bus_order[center_idx + 1:]
+
+    # Center bus
+    positions[center_id] = {"x": center_x, "y": BUS_Y}
+
+    # Buses to the left of center
+    for i, bus_id in enumerate(reversed(left_buses)):
+        positions[bus_id] = {
+            "x": center_x - (i + 1) * BUS_SPACING,
+            "y": BUS_Y,
+        }
+
+    # Buses to the right of center
+    for i, bus_id in enumerate(right_buses):
+        positions[bus_id] = {
+            "x": center_x + (i + 1) * BUS_SPACING,
+            "y": BUS_Y,
+        }
+
+    return positions
+
+
+def _position_substations(
+    result: ViewResult,
+    bus_positions: dict[str, dict[str, float]],
+) -> dict[str, dict[str, float]]:
+    """Position substation group nodes at the centroid of their buses."""
+    positions: dict[str, dict[str, float]] = {}
+
+    # Group buses by substation
+    buses_by_sub: dict[str, list[str]] = defaultdict(list)
+    for bus in result.buses:
+        if bus.substation_id:
+            buses_by_sub[bus.substation_id].append(bus.id)
+
+    for sub_id, bus_ids in buses_by_sub.items():
+        if not bus_ids:
+            continue
+
+        # Compute centroid of bus positions
+        x_sum = sum(bus_positions[bid]["x"] for bid in bus_ids if bid in bus_positions)
+        y_sum = sum(bus_positions[bid]["y"] for bid in bus_ids if bid in bus_positions)
+        count = len([bid for bid in bus_ids if bid in bus_positions])
+
+        if count > 0:
+            positions[sub_id] = {
+                "x": x_sum / count,
+                "y": y_sum / count - 30,  # Slightly above buses
+            }
+
+    return positions
 
 
 def _position_transformers(
@@ -179,7 +239,7 @@ def _position_equipment(
     result: ViewResult,
     bus_positions: dict[str, dict[str, float]],
 ) -> dict[str, dict[str, float]]:
-    """Position equipment nodes offset from their parent bus."""
+    """Position equipment nodes BELOW their parent bus."""
     positions: dict[str, dict[str, float]] = {}
 
     # Group equipment by bus
@@ -192,15 +252,15 @@ def _position_equipment(
         if not bus_pos:
             continue
 
-        # Spread equipment horizontally below the bus
+        # Spread equipment horizontally BELOW the bus
         num_eq = len(equipment_list)
-        total_width = (num_eq - 1) * 30 if num_eq > 1 else 0
+        total_width = (num_eq - 1) * EQUIPMENT_SPACING if num_eq > 1 else 0
         start_x = bus_pos["x"] - total_width / 2
 
         for i, eq in enumerate(equipment_list):
             positions[eq.id] = {
-                "x": start_x + i * 30,
-                "y": bus_pos["y"] + EQUIPMENT_OFFSET,
+                "x": start_x + i * EQUIPMENT_SPACING,
+                "y": bus_pos["y"] + EQUIPMENT_OFFSET,  # BELOW bus (positive Y is down)
             }
 
     return positions
@@ -212,8 +272,7 @@ def _position_terminals(
 ) -> dict[str, dict[str, float]]:
     """Position terminal nodes along their parent bus.
 
-    Note: Terminal positions are computed on frontend based on edge directions.
-    This provides default positions that can be overridden.
+    Terminals are positioned on the bus bar itself (same Y as bus).
     """
     positions: dict[str, dict[str, float]] = {}
 
@@ -233,15 +292,11 @@ def _position_terminals(
                 continue
 
             term_id = f"{bus_id}_term_{terminal_index[bus_id]}"
-            count = terminal_count[bus_id]
 
-            # Spread terminals vertically along the bus
-            spread = min(count - 1, 4) * 10  # Max spread of 40px
-            offset = -spread / 2 + terminal_index[bus_id] * (spread / max(count - 1, 1))
-
+            # Terminal at same position as bus (will be refined by frontend)
             positions[term_id] = {
                 "x": bus_pos["x"],
-                "y": bus_pos["y"] + offset,
+                "y": bus_pos["y"],
             }
 
             terminal_index[bus_id] += 1
