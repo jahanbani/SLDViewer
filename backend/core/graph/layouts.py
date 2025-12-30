@@ -1,27 +1,29 @@
 """Layout algorithms for SLD Viewer.
 
-Computes node positions for graph visualization using NetworkX.
+Computes node positions for graph visualization using a hierarchical
+layered layout that creates clean routing channels for orthogonal edges.
 """
 
-from collections import defaultdict
-
-import networkx as nx
+from collections import defaultdict, deque
 
 from backend.core.graph.models import ViewResult, BusModel, BranchModel
 
 
 # Layout constants
-SCALE = 200  # Scale factor for layout
-EQUIPMENT_OFFSET = 60  # Distance from bus to equipment (below)
+LAYER_SPACING = 200  # Vertical spacing between layers
+NODE_SPACING = 180   # Horizontal spacing between nodes in a layer
+STAGGER_OFFSET = 60  # Horizontal offset for staggering to avoid vertical alignment
+EQUIPMENT_OFFSET = 60  # Distance from bus to equipment
 EQUIPMENT_SPACING = 35  # Horizontal spacing between equipment items
 TRANSFORMER_OFFSET = 40  # Distance from bus to transformer
 
 
 def compute_substation_layout(result: ViewResult) -> dict[str, dict[str, float]]:
-    """Compute positions for all nodes using NetworkX layout algorithms.
+    """Compute positions for all nodes using hierarchical layered layout.
 
-    Uses Kamada-Kawai layout which minimizes edge crossings better than
-    simple heuristics. Falls back to spring layout if KK fails.
+    Uses BFS from center bus to assign layers, then positions nodes
+    within each layer with staggering to prevent vertical alignment.
+    This creates natural routing channels for orthogonal (taxi) edges.
 
     Args:
         result: ViewResult containing buses, branches, equipment, substations
@@ -34,38 +36,21 @@ def compute_substation_layout(result: ViewResult) -> dict[str, dict[str, float]]
     if not result.buses:
         return positions
 
-    # Build NetworkX graph from buses and branches
-    G = nx.Graph()
-    for bus in result.buses:
-        G.add_node(bus.id)
-    for branch in result.branches:
-        if branch.from_bus_id in G and branch.to_bus_id in G:
-            G.add_edge(branch.from_bus_id, branch.to_bus_id)
-
-    # Find center bus for positioning reference
+    # Build adjacency from branches
     adjacency: dict[str, list[str]] = defaultdict(list)
     for branch in result.branches:
         adjacency[branch.from_bus_id].append(branch.to_bus_id)
         adjacency[branch.to_bus_id].append(branch.from_bus_id)
+
+    # Find center bus
     center_bus_id = _find_center_bus(result, adjacency)
 
-    # Use Kamada-Kawai layout (minimizes edge crossings)
-    try:
-        nx_positions = nx.kamada_kawai_layout(G, scale=SCALE)
-    except Exception:
-        # Fallback to spring layout
-        nx_positions = nx.spring_layout(G, scale=SCALE, seed=42)
+    # Assign layers using BFS from center
+    bus_ids = {bus.id for bus in result.buses}
+    layers = _assign_layers_bfs(center_bus_id, adjacency, bus_ids)
 
-    # Convert NetworkX positions to our format and shift to positive coordinates
-    min_x = min(pos[0] for pos in nx_positions.values()) if nx_positions else 0
-    min_y = min(pos[1] for pos in nx_positions.values()) if nx_positions else 0
-
-    bus_positions: dict[str, dict[str, float]] = {}
-    for bus_id, (x, y) in nx_positions.items():
-        bus_positions[bus_id] = {
-            "x": (x - min_x) + SCALE / 2,  # Shift to positive, add padding
-            "y": (y - min_y) + SCALE / 2,
-        }
+    # Position buses using hierarchical layout with staggering
+    bus_positions = _position_buses_hierarchical(layers, adjacency)
     positions.update(bus_positions)
 
     # Position substation groups around their buses
@@ -83,6 +68,114 @@ def compute_substation_layout(result: ViewResult) -> dict[str, dict[str, float]]
     # Position terminal nodes (along their parent bus)
     terminal_positions = _position_terminals(result, bus_positions)
     positions.update(terminal_positions)
+
+    return positions
+
+
+def _assign_layers_bfs(
+    center_id: str,
+    adjacency: dict[str, list[str]],
+    node_ids: set[str],
+) -> dict[int, list[str]]:
+    """Assign nodes to layers using BFS from center.
+
+    Layer 0 = center node
+    Layer 1 = immediate neighbors
+    Layer 2 = neighbors of neighbors
+    etc.
+
+    Returns:
+        Dict mapping layer number to list of node IDs in that layer
+    """
+    layers: dict[int, list[str]] = defaultdict(list)
+    visited: set[str] = set()
+    queue: deque[tuple[str, int]] = deque()
+
+    # Start from center
+    if center_id in node_ids:
+        queue.append((center_id, 0))
+        visited.add(center_id)
+
+    while queue:
+        node_id, layer = queue.popleft()
+        layers[layer].append(node_id)
+
+        for neighbor_id in adjacency.get(node_id, []):
+            if neighbor_id not in visited and neighbor_id in node_ids:
+                visited.add(neighbor_id)
+                queue.append((neighbor_id, layer + 1))
+
+    # Add any disconnected nodes to layer 0
+    for node_id in node_ids:
+        if node_id not in visited:
+            layers[0].append(node_id)
+
+    return dict(layers)
+
+
+def _position_buses_hierarchical(
+    layers: dict[int, list[str]],
+    adjacency: dict[str, list[str]],
+) -> dict[str, dict[str, float]]:
+    """Position buses in a hierarchical layout with staggering.
+
+    - Layer 0 (center) is in the middle vertically
+    - Layers alternate above and below the center
+    - Nodes within a layer are spread horizontally
+    - Staggering prevents vertical alignment between adjacent layers
+
+    Returns:
+        Dict mapping bus ID to {x, y} position
+    """
+    positions: dict[str, dict[str, float]] = {}
+
+    if not layers:
+        return positions
+
+    # Sort layer numbers
+    sorted_layers = sorted(layers.keys())
+    max_layer = max(sorted_layers) if sorted_layers else 0
+
+    # Calculate base Y position for each layer
+    # Layer 0 at center, odd layers below, even layers above (alternating)
+    layer_y: dict[int, float] = {}
+    center_y = (max_layer + 1) * LAYER_SPACING / 2
+
+    for layer_num in sorted_layers:
+        if layer_num == 0:
+            layer_y[layer_num] = center_y
+        elif layer_num % 2 == 1:
+            # Odd layers go below: 1, 3, 5...
+            layer_y[layer_num] = center_y + ((layer_num + 1) // 2) * LAYER_SPACING
+        else:
+            # Even layers go above: 2, 4, 6...
+            layer_y[layer_num] = center_y - (layer_num // 2) * LAYER_SPACING
+
+    # Position nodes within each layer
+    for layer_num, node_ids in layers.items():
+        num_nodes = len(node_ids)
+        if num_nodes == 0:
+            continue
+
+        # Calculate total width for this layer
+        total_width = (num_nodes - 1) * NODE_SPACING
+        start_x = -total_width / 2
+
+        # Apply stagger offset for non-zero layers to avoid vertical alignment
+        stagger = STAGGER_OFFSET if layer_num % 2 == 1 else 0
+
+        for i, node_id in enumerate(node_ids):
+            x = start_x + i * NODE_SPACING + stagger
+            y = layer_y[layer_num]
+            positions[node_id] = {"x": x, "y": y}
+
+    # Shift all positions to be positive with padding
+    if positions:
+        min_x = min(p["x"] for p in positions.values())
+        min_y = min(p["y"] for p in positions.values())
+        for pos in positions.values():
+            pos["x"] = pos["x"] - min_x + 100  # Add padding
+            pos["y"] = pos["y"] - min_y + 100
 
     return positions
 

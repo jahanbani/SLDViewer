@@ -181,11 +181,19 @@ const EQUIPMENT_STYLES: Record<string, { color: string; shape: string; label: st
 const EQUIPMENT_OFFSET = 60; // Distance from bus to first equipment (increased to avoid line overlap)
 const EQUIPMENT_SPACING = 30; // Spacing between equipment nodes (increased for better separation)
 
+// Constants for bus sizing
+const BUS_MIN_LENGTH = 40;  // Minimum bus length
+const BUS_TERMINAL_SPACING = 20;  // Spacing between terminals along the bus
+const BUS_THICKNESS = 12;  // Bus bar thickness (short dimension)
+
 /**
  * Reposition terminal nodes along their parent bus bar.
- * Terminals are positioned on the side of the bus facing their connected edge.
- * For vertical buses: left side or right side
- * For horizontal buses: top side or bottom side
+ * Terminals are positioned ONLY on the long sides of the bus:
+ * - Vertical buses: terminals on LEFT and RIGHT sides
+ * - Horizontal buses: terminals on TOP and BOTTOM sides
+ *
+ * This prevents lines from "sticking" along the bus edges.
+ * Bus length is adjusted based on the number of connections.
  */
 function repositionTerminals(cy: Core, verticalBuses: Set<string>): void {
   // Group terminals by their bus_id
@@ -207,17 +215,17 @@ function repositionTerminals(cy: Core, verticalBuses: Set<string>): void {
     const busPos = busNode.position();
     const isVertical = verticalBuses.has(busId);
 
-    // Separate terminals by which side they should be on
-    // based on where their connected edge goes
-    const leftOrTop: NodeSingular[] = [];
-    const rightOrBottom: NodeSingular[] = [];
+    // Separate terminals into two sides (long sides only)
+    // For vertical buses: LEFT and RIGHT
+    // For horizontal buses: TOP and BOTTOM
+    const side1Terminals: NodeSingular[] = [];  // Left (vertical) or Top (horizontal)
+    const side2Terminals: NodeSingular[] = [];  // Right (vertical) or Bottom (horizontal)
 
     terminals.forEach((termNode) => {
       // Find the edge connected to this terminal
       const connectedEdges = termNode.connectedEdges();
       if (connectedEdges.empty()) {
-        // No edge - default to left/top
-        leftOrTop.push(termNode);
+        side1Terminals.push(termNode);
         return;
       }
 
@@ -229,31 +237,31 @@ function repositionTerminals(cy: Core, verticalBuses: Set<string>): void {
       const otherNode = cy.getElementById(otherId);
 
       if (otherNode.empty()) {
-        leftOrTop.push(termNode);
+        side1Terminals.push(termNode);
         return;
       }
 
       const otherPos = otherNode.position();
 
       if (isVertical) {
-        // Vertical bus: check if other node is left or right
+        // Vertical bus: terminals on LEFT or RIGHT based on X position
         if (otherPos.x < busPos.x) {
-          leftOrTop.push(termNode); // Left side
+          side1Terminals.push(termNode);  // Left side
         } else {
-          rightOrBottom.push(termNode); // Right side
+          side2Terminals.push(termNode);  // Right side
         }
       } else {
-        // Horizontal bus: check if other node is above or below
+        // Horizontal bus: terminals on TOP or BOTTOM based on Y position
         if (otherPos.y < busPos.y) {
-          leftOrTop.push(termNode); // Top side
+          side1Terminals.push(termNode);  // Top side
         } else {
-          rightOrBottom.push(termNode); // Bottom side
+          side2Terminals.push(termNode);  // Bottom side
         }
       }
     });
 
-    // Sort terminals on each side by the Y position (vertical) or X position (horizontal) of their other end
-    const sortByOtherPosition = (a: NodeSingular, b: NodeSingular) => {
+    // Sort terminals by the position of their connected node along the bus axis
+    const sortByOtherAlongBus = (a: NodeSingular, b: NodeSingular) => {
       const getOtherPos = (term: NodeSingular) => {
         const edge = term.connectedEdges().first();
         if (!edge) return 0;
@@ -262,73 +270,83 @@ function repositionTerminals(cy: Core, verticalBuses: Set<string>): void {
         const otherId = sourceId === term.id() ? targetId : sourceId;
         const other = cy.getElementById(otherId);
         if (other.empty()) return 0;
+        // For vertical bus, sort by Y; for horizontal bus, sort by X
         return isVertical ? other.position().y : other.position().x;
       };
       return getOtherPos(a) - getOtherPos(b);
     };
 
-    leftOrTop.sort(sortByOtherPosition);
-    rightOrBottom.sort(sortByOtherPosition);
+    side1Terminals.sort(sortByOtherAlongBus);
+    side2Terminals.sort(sortByOtherAlongBus);
 
-    // Bus dimensions - scale spread based on terminal count
-    // For 1-2 terminals: keep them centered with minimal spread
-    // For 3+ terminals: use full bus length
-    const busLength = 50;
-    const getSpread = (count: number) => {
-      if (count <= 1) return 0;
-      if (count === 2) return 20; // Small gap for 2 terminals
-      return busLength; // Full spread for 3+
-    };
+    // Calculate bus length based on max terminals on either side
+    const maxTerminalsOnOneSide = Math.max(side1Terminals.length, side2Terminals.length, 1);
+    const busLength = Math.max(BUS_MIN_LENGTH, maxTerminalsOnOneSide * BUS_TERMINAL_SPACING);
+    const busHalfLength = busLength / 2;
+    const busHalfThickness = BUS_THICKNESS / 2;
+
+    // Update bus size
+    if (isVertical) {
+      busNode.style({
+        width: BUS_THICKNESS,
+        height: busLength,
+      });
+    } else {
+      busNode.style({
+        width: busLength,
+        height: BUS_THICKNESS,
+      });
+    }
+
+    // Helper to calculate position along the bus
     const calcOffset = (idx: number, count: number) => {
       if (count <= 1) return 0;
-      const spread = getSpread(count);
-      return -spread / 2 + (idx / (count - 1)) * spread;
+      // Spread terminals evenly along the bus, with some margin from ends
+      const margin = 5;
+      const usableLength = busLength - 2 * margin;
+      return -usableLength / 2 + margin + (idx / (count - 1)) * (usableLength - 2 * margin);
     };
 
-    // Position terminals on left/top side
-    leftOrTop.forEach((termNode, idx) => {
-      const count = leftOrTop.length;
-      const offset = calcOffset(idx, count);
+    // Position side1 terminals (Left for vertical, Top for horizontal)
+    side1Terminals.forEach((termNode, idx) => {
+      const offset = calcOffset(idx, side1Terminals.length);
 
       if (isVertical) {
+        // Left side of vertical bus
         termNode.position({
-          x: busPos.x - 6, // Left side of bus
+          x: busPos.x - busHalfThickness,
           y: busPos.y + offset,
         });
+        termNode.scratch("_busOffset", { x: -busHalfThickness, y: offset });
       } else {
+        // Top side of horizontal bus
         termNode.position({
           x: busPos.x + offset,
-          y: busPos.y - 6, // Top side of bus
+          y: busPos.y - busHalfThickness,
         });
+        termNode.scratch("_busOffset", { x: offset, y: -busHalfThickness });
       }
-
-      termNode.scratch("_busOffset", {
-        x: termNode.position().x - busPos.x,
-        y: termNode.position().y - busPos.y,
-      });
     });
 
-    // Position terminals on right/bottom side
-    rightOrBottom.forEach((termNode, idx) => {
-      const count = rightOrBottom.length;
-      const offset = calcOffset(idx, count);
+    // Position side2 terminals (Right for vertical, Bottom for horizontal)
+    side2Terminals.forEach((termNode, idx) => {
+      const offset = calcOffset(idx, side2Terminals.length);
 
       if (isVertical) {
+        // Right side of vertical bus
         termNode.position({
-          x: busPos.x + 6, // Right side of bus
+          x: busPos.x + busHalfThickness,
           y: busPos.y + offset,
         });
+        termNode.scratch("_busOffset", { x: busHalfThickness, y: offset });
       } else {
+        // Bottom side of horizontal bus
         termNode.position({
           x: busPos.x + offset,
-          y: busPos.y + 6, // Bottom side of bus
+          y: busPos.y + busHalfThickness,
         });
+        termNode.scratch("_busOffset", { x: offset, y: busHalfThickness });
       }
-
-      termNode.scratch("_busOffset", {
-        x: termNode.position().x - busPos.x,
-        y: termNode.position().y - busPos.y,
-      });
     });
   });
 }
@@ -341,7 +359,7 @@ function repositionTerminals(cy: Core, verticalBuses: Set<string>): void {
 function repositionEquipment(cy: Core, verticalBuses: Set<string>): void {
   // Get all equipment nodes grouped by their bus_id
   const equipmentByBus = new Map<string, NodeSingular[]>();
-  
+
   cy.nodes("[kind='equipment']").forEach((eqNode) => {
     const busId = eqNode.data("bus_id") as string;
     if (!equipmentByBus.has(busId)) {
@@ -359,13 +377,17 @@ function repositionEquipment(cy: Core, verticalBuses: Set<string>): void {
     const numEquipment = equipmentNodes.length;
     const isVertical = verticalBuses.has(busId);
 
+    // Get current bus dimensions (set by repositionTerminals)
+    const busWidth = busNode.style("width") ? parseFloat(busNode.style("width")) : BUS_MIN_LENGTH;
+    const busHeight = busNode.style("height") ? parseFloat(busNode.style("height")) : BUS_MIN_LENGTH;
+
     if (isVertical) {
       // Vertical bus: equipment in a column to the right
       const totalHeight = (numEquipment - 1) * EQUIPMENT_SPACING;
       const startY = busPos.y - totalHeight / 2;
 
       equipmentNodes.forEach((eqNode, index) => {
-        const offsetX = EQUIPMENT_OFFSET;
+        const offsetX = busWidth / 2 + EQUIPMENT_OFFSET;
         const offsetY = startY + index * EQUIPMENT_SPACING - busPos.y;
 
         eqNode.position({
@@ -383,7 +405,7 @@ function repositionEquipment(cy: Core, verticalBuses: Set<string>): void {
 
       equipmentNodes.forEach((eqNode, index) => {
         const offsetX = startX + index * EQUIPMENT_SPACING - busPos.x;
-        const offsetY = EQUIPMENT_OFFSET;
+        const offsetY = busHeight / 2 + EQUIPMENT_OFFSET;
 
         eqNode.position({
           x: startX + index * EQUIPMENT_SPACING,
@@ -392,23 +414,6 @@ function repositionEquipment(cy: Core, verticalBuses: Set<string>): void {
 
         // Store offset for drag handler
         eqNode.scratch("_offset", { x: offsetX, y: offsetY });
-      });
-    }
-  });
-
-  // Update bus node sizes based on orientation
-  cy.nodes("[kind='bus']").forEach((busNode) => {
-    const busId = busNode.id();
-    const isVertical = verticalBuses.has(busId);
-    if (isVertical) {
-      busNode.style({
-        width: 12,
-        height: 60,
-      });
-    } else {
-      busNode.style({
-        width: 60,
-        height: 12,
       });
     }
   });
@@ -694,13 +699,13 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
             "border-color": "#333",
           },
         },
-        // Bus nodes - rectangular bar shape
+        // Bus nodes - rectangular bar shape (size set dynamically by repositionTerminals)
         {
           selector: "node[kind='bus']",
           style: {
             shape: "round-rectangle",
-            width: 60,
-            height: 12,
+            width: BUS_THICKNESS,  // Will be overridden for horizontal buses
+            height: BUS_MIN_LENGTH,  // Will be overridden based on connection count
             "text-valign": "top",
             "text-margin-y": -4,
             label: (ele: NodeSingular) => {
@@ -899,6 +904,7 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
     if (!showSubstationGroupsRef.current) {
       cy.batch(() => {
         cy.nodes("[kind='substation_group']").style("display", "none");
+        // Move all nodes out of compound parents
         cy.nodes("[kind='bus']").forEach((busNode) => {
           if (busNode.parent().length > 0) {
             busNode.move({ parent: null });
@@ -907,6 +913,16 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
         cy.nodes("[kind='terminal']").forEach((termNode) => {
           if (termNode.parent().length > 0) {
             termNode.move({ parent: null });
+          }
+        });
+        cy.nodes("[kind='equipment']").forEach((eqNode) => {
+          if (eqNode.parent().length > 0) {
+            eqNode.move({ parent: null });
+          }
+        });
+        cy.nodes("[kind='transformer']").forEach((xfNode) => {
+          if (xfNode.parent().length > 0) {
+            xfNode.move({ parent: null });
           }
         });
       });
@@ -1027,7 +1043,7 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
         // Show substation groups
         substationGroups.style("display", "element");
 
-        // Restore parent references for buses and terminals
+        // Restore parent references for buses, terminals, equipment, and transformers
         cy.nodes("[kind='bus']").forEach((busNode) => {
           const substationId = busNode.data("substation_id");
           if (substationId) {
@@ -1050,11 +1066,35 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
             }
           }
         });
+        // Restore parent for equipment
+        cy.nodes("[kind='equipment']").forEach((eqNode) => {
+          const busId = eqNode.data("bus_id");
+          const busNode = cy.getElementById(busId);
+          if (!busNode.empty()) {
+            const substationId = busNode.data("substation_id");
+            if (substationId) {
+              const parentNode = cy.getElementById(substationId);
+              if (!parentNode.empty() && parentNode.data("kind") === "substation_group") {
+                eqNode.move({ parent: substationId });
+              }
+            }
+          }
+        });
+        // Restore parent for transformers
+        cy.nodes("[kind='transformer']").forEach((xfNode) => {
+          const storedParent = xfNode.data("parent");
+          if (storedParent) {
+            const parentNode = cy.getElementById(storedParent);
+            if (!parentNode.empty() && parentNode.data("kind") === "substation_group") {
+              xfNode.move({ parent: storedParent });
+            }
+          }
+        });
       } else {
         // Hide substation groups
         substationGroups.style("display", "none");
 
-        // Remove parent references (move buses and terminals out of compound nodes)
+        // Remove parent references (move all nodes out of compound nodes)
         cy.nodes("[kind='bus']").forEach((busNode) => {
           if (busNode.parent().length > 0) {
             busNode.move({ parent: null });
@@ -1063,6 +1103,16 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
         cy.nodes("[kind='terminal']").forEach((termNode) => {
           if (termNode.parent().length > 0) {
             termNode.move({ parent: null });
+          }
+        });
+        cy.nodes("[kind='equipment']").forEach((eqNode) => {
+          if (eqNode.parent().length > 0) {
+            eqNode.move({ parent: null });
+          }
+        });
+        cy.nodes("[kind='transformer']").forEach((xfNode) => {
+          if (xfNode.parent().length > 0) {
+            xfNode.move({ parent: null });
           }
         });
       }
