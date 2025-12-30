@@ -49,8 +49,8 @@ def compute_substation_layout(result: ViewResult) -> dict[str, dict[str, float]]
     # BFS to order buses by distance from center
     bus_order = _bfs_order_buses(center_bus_id, adjacency, result.buses)
 
-    # Position buses on horizontal line, center bus in middle
-    bus_positions = _position_buses_horizontal(bus_order, center_bus_id)
+    # Position buses in 2D layout (horizontal + vertical for distant buses)
+    bus_positions = _position_buses_2d(bus_order, center_bus_id, adjacency)
     positions.update(bus_positions)
 
     # Position substation groups around their buses
@@ -125,49 +125,95 @@ def _bfs_order_buses(
     return order
 
 
-def _position_buses_horizontal(
+def _position_buses_2d(
     bus_order: list[str],
     center_id: str,
+    adjacency: dict[str, list[str]],
 ) -> dict[str, dict[str, float]]:
-    """Position buses on a horizontal line, center bus in middle.
+    """Position buses in 2D to minimize line crossings.
 
-    Neighbors alternate left/right from center so that adjacent buses
-    in the graph are adjacent in the layout.
+    Strategy:
+    - Center bus in the middle
+    - Direct neighbors of center: alternate left/right on same row
+    - Buses 2+ hops away: place on rows above/below to avoid crossings
     """
     positions: dict[str, dict[str, float]] = {}
 
     if not bus_order:
         return positions
 
-    # Position center at middle
+    # Calculate center position
     center_x = len(bus_order) * BUS_SPACING / 2
+    center_y = BUS_Y
 
-    # Center bus first
+    # Track which buses are direct neighbors of center
+    center_neighbors = set(adjacency.get(center_id, []))
+
+    # Position center bus
     if center_id in bus_order:
-        positions[center_id] = {"x": center_x, "y": BUS_Y}
+        positions[center_id] = {"x": center_x, "y": center_y}
 
-    # Get non-center buses in BFS order (neighbors first)
-    other_buses = [b for b in bus_order if b != center_id]
+    # Separate direct neighbors from distant buses
+    direct_neighbors = []
+    distant_buses = []
 
-    # Alternate left/right placement for neighbors
-    # This ensures directly connected buses are adjacent in layout
+    for bus_id in bus_order:
+        if bus_id == center_id:
+            continue
+        if bus_id in center_neighbors:
+            direct_neighbors.append(bus_id)
+        else:
+            distant_buses.append(bus_id)
+
+    # Position direct neighbors: alternate left/right on same row
     left_count = 0
     right_count = 0
 
-    for i, bus_id in enumerate(other_buses):
+    for i, bus_id in enumerate(direct_neighbors):
         if i % 2 == 0:
-            # Even index -> right side
             right_count += 1
             positions[bus_id] = {
                 "x": center_x + right_count * BUS_SPACING,
-                "y": BUS_Y,
+                "y": center_y,
             }
         else:
-            # Odd index -> left side
             left_count += 1
             positions[bus_id] = {
                 "x": center_x - left_count * BUS_SPACING,
-                "y": BUS_Y,
+                "y": center_y,
+            }
+
+    # Position distant buses: place below their connected neighbor
+    row_offset = BUS_SPACING  # Vertical spacing for lower rows
+    placed_in_column: dict[float, int] = {}  # x -> count of buses in that column
+
+    for bus_id in distant_buses:
+        # Find which positioned bus this one connects to
+        connected_to = None
+        for neighbor in adjacency.get(bus_id, []):
+            if neighbor in positions:
+                connected_to = neighbor
+                break
+
+        if connected_to:
+            # Place below the connected bus
+            parent_pos = positions[connected_to]
+            parent_x = parent_pos["x"]
+
+            # Track how many buses are already in this column
+            col_count = placed_in_column.get(parent_x, 0)
+            placed_in_column[parent_x] = col_count + 1
+
+            positions[bus_id] = {
+                "x": parent_x,
+                "y": center_y + row_offset * (col_count + 1),
+            }
+        else:
+            # No connection found - place at end of main row
+            right_count += 1
+            positions[bus_id] = {
+                "x": center_x + right_count * BUS_SPACING,
+                "y": center_y,
             }
 
     return positions
