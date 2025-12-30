@@ -431,12 +431,15 @@ const BASE_TURN_DISTANCE = 40;
  * 1. All line angles must be 90 degrees (orthogonal)
  * 2. No line should stick to a bus (run parallel along its edge)
  * 3. No lines should overlap for more than a few pixels
+ * 4. Distribute terminals on BOTH sides of the bus to prevent overlap
  *
- * Solution: Use taxi routing with different taxi-turn values for each edge,
- * creating parallel orthogonal "routing channels".
+ * Solution:
+ * - Distribute edges across left/right (or top/bottom) sides of the bus
+ * - taxi-direction based on which SIDE the terminal is on
+ * - Different taxi-turn values for edges on the same side
  */
 function optimizeEdgeRouting(cy: Core, verticalBuses: Set<string>): void {
-  // Group edges by their source bus to assign different channels
+  // Group edges by their source bus
   const edgesBySourceBus = new Map<string, cytoscape.EdgeSingular[]>();
 
   cy.edges().forEach((edge) => {
@@ -456,43 +459,55 @@ function optimizeEdgeRouting(cy: Core, verticalBuses: Set<string>): void {
   edgesBySourceBus.forEach((edges, sourceBusId) => {
     const sourceIsVertical = verticalBuses.has(sourceBusId);
 
-    // Group edges by direction (left, right, up, down relative to source)
-    const leftEdges: cytoscape.EdgeSingular[] = [];
-    const rightEdges: cytoscape.EdgeSingular[] = [];
-    const upEdges: cytoscape.EdgeSingular[] = [];
-    const downEdges: cytoscape.EdgeSingular[] = [];
+    // For vertical bus: distribute on LEFT and RIGHT sides based on target X position
+    // For horizontal bus: distribute on TOP and BOTTOM sides based on target Y position
+    const side1Edges: cytoscape.EdgeSingular[] = [];  // Left (vertical) or Top (horizontal)
+    const side2Edges: cytoscape.EdgeSingular[] = [];  // Right (vertical) or Bottom (horizontal)
+
+    // Get bus position to determine which side each edge should use
+    const busNode = cy.getElementById(sourceBusId);
+    const busPos = busNode.empty() ? null : busNode.position();
 
     edges.forEach((edge) => {
-      const sourcePos = edge.source().position();
       const targetPos = edge.target().position();
-      const dx = targetPos.x - sourcePos.x;
-      const dy = targetPos.y - sourcePos.y;
 
-      // Categorize by primary direction
-      if (Math.abs(dx) > Math.abs(dy)) {
-        // Primarily horizontal
-        if (dx > 0) rightEdges.push(edge);
-        else leftEdges.push(edge);
+      if (sourceIsVertical) {
+        // Vertical bus: distribute based on target X relative to bus X
+        // If target is left of bus → use left side; if right → use right side
+        if (busPos && targetPos.x < busPos.x) {
+          side1Edges.push(edge);  // Left side
+        } else {
+          side2Edges.push(edge);  // Right side
+        }
       } else {
-        // Primarily vertical
-        if (dy > 0) downEdges.push(edge);
-        else upEdges.push(edge);
+        // Horizontal bus: distribute based on target Y relative to bus Y
+        // If target is above bus → use top side; if below → use bottom side
+        if (busPos && targetPos.y < busPos.y) {
+          side1Edges.push(edge);  // Top side
+        } else {
+          side2Edges.push(edge);  // Bottom side
+        }
       }
     });
 
-    // Sort edges in each group by their secondary axis to create consistent channel assignment
-    const sortBySecondary = (a: cytoscape.EdgeSingular, b: cytoscape.EdgeSingular, useY: boolean) => {
+    // Sort edges on each side by secondary position for consistent channel assignment
+    const sortByPosition = (a: cytoscape.EdgeSingular, b: cytoscape.EdgeSingular, useX: boolean) => {
       const aTarget = a.target().position();
       const bTarget = b.target().position();
-      return useY ? aTarget.y - bTarget.y : aTarget.x - bTarget.x;
+      return useX ? aTarget.x - bTarget.x : aTarget.y - bTarget.y;
     };
 
-    leftEdges.sort((a, b) => sortBySecondary(a, b, true));
-    rightEdges.sort((a, b) => sortBySecondary(a, b, true));
-    upEdges.sort((a, b) => sortBySecondary(a, b, false));
-    downEdges.sort((a, b) => sortBySecondary(a, b, false));
+    if (sourceIsVertical) {
+      // Sort by Y position (so closer targets get inner channels)
+      side1Edges.sort((a, b) => sortByPosition(a, b, false));
+      side2Edges.sort((a, b) => sortByPosition(a, b, false));
+    } else {
+      // Sort by X position
+      side1Edges.sort((a, b) => sortByPosition(a, b, true));
+      side2Edges.sort((a, b) => sortByPosition(a, b, true));
+    }
 
-    // Apply orthogonal taxi routing with different turn distances
+    // Apply taxi routing based on which side the edge exits from
     const applyTaxiRouting = (
       edgeGroup: cytoscape.EdgeSingular[],
       taxiDirection: string
@@ -502,7 +517,6 @@ function optimizeEdgeRouting(cy: Core, verticalBuses: Set<string>): void {
 
       edgeGroup.forEach((edge, index) => {
         // Each edge gets a different taxi-turn value to create separate channels
-        // First edge turns at BASE_TURN_DISTANCE, second at BASE + SPACING, etc.
         const turnDistance = BASE_TURN_DISTANCE + index * CHANNEL_SPACING;
 
         edge.style({
@@ -514,22 +528,15 @@ function optimizeEdgeRouting(cy: Core, verticalBuses: Set<string>): void {
       });
     };
 
-    // Apply routing based on source bus orientation
-    // Goal: First segment exits PERPENDICULAR to the source bus
+    // Apply routing: side determines direction
     if (sourceIsVertical) {
-      // Vertical bus: first segment should go horizontal
-      applyTaxiRouting(leftEdges, "leftward");
-      applyTaxiRouting(rightEdges, "rightward");
-      // For up/down edges from vertical bus, use horizontal-first to exit perpendicular
-      applyTaxiRouting(upEdges, "leftward");  // Go left first, then up
-      applyTaxiRouting(downEdges, "rightward");  // Go right first, then down
+      // Left side → go leftward first; Right side → go rightward first
+      applyTaxiRouting(side1Edges, "leftward");
+      applyTaxiRouting(side2Edges, "rightward");
     } else {
-      // Horizontal bus: first segment should go vertical
-      applyTaxiRouting(upEdges, "upward");
-      applyTaxiRouting(downEdges, "downward");
-      // For left/right edges from horizontal bus, use vertical-first to exit perpendicular
-      applyTaxiRouting(leftEdges, "upward");  // Go up first, then left
-      applyTaxiRouting(rightEdges, "downward");  // Go down first, then right
+      // Top side → go upward first; Bottom side → go downward first
+      applyTaxiRouting(side1Edges, "upward");
+      applyTaxiRouting(side2Edges, "downward");
     }
   });
 }
