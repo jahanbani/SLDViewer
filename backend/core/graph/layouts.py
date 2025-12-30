@@ -1,30 +1,27 @@
 """Layout algorithms for SLD Viewer.
 
-Computes node positions for graph visualization.
+Computes node positions for graph visualization using NetworkX.
 """
 
 from collections import defaultdict
+
+import networkx as nx
 
 from backend.core.graph.models import ViewResult, BusModel, BranchModel
 
 
 # Layout constants
-BUS_SPACING = 200  # Horizontal spacing between buses
+SCALE = 200  # Scale factor for layout
 EQUIPMENT_OFFSET = 60  # Distance from bus to equipment (below)
 EQUIPMENT_SPACING = 35  # Horizontal spacing between equipment items
 TRANSFORMER_OFFSET = 40  # Distance from bus to transformer
-BUS_Y = 100  # Y position for all buses (same horizontal line)
 
 
 def compute_substation_layout(result: ViewResult) -> dict[str, dict[str, float]]:
-    """Compute positions for all nodes using horizontal bus layout.
+    """Compute positions for all nodes using NetworkX layout algorithms.
 
-    Layout strategy:
-    1. Place center bus in the middle
-    2. Spread connected buses left and right using BFS
-    3. All buses on the SAME horizontal line
-    4. Equipment positioned BELOW their parent bus
-    5. Transformers between connected buses
+    Uses Kamada-Kawai layout which minimizes edge crossings better than
+    simple heuristics. Falls back to spring layout if KK fails.
 
     Args:
         result: ViewResult containing buses, branches, equipment, substations
@@ -37,20 +34,38 @@ def compute_substation_layout(result: ViewResult) -> dict[str, dict[str, float]]
     if not result.buses:
         return positions
 
-    # Build adjacency list for BFS ordering
+    # Build NetworkX graph from buses and branches
+    G = nx.Graph()
+    for bus in result.buses:
+        G.add_node(bus.id)
+    for branch in result.branches:
+        if branch.from_bus_id in G and branch.to_bus_id in G:
+            G.add_edge(branch.from_bus_id, branch.to_bus_id)
+
+    # Find center bus for positioning reference
     adjacency: dict[str, list[str]] = defaultdict(list)
     for branch in result.branches:
         adjacency[branch.from_bus_id].append(branch.to_bus_id)
         adjacency[branch.to_bus_id].append(branch.from_bus_id)
-
-    # Find center bus (from metadata or most connected)
     center_bus_id = _find_center_bus(result, adjacency)
 
-    # BFS to order buses by distance from center
-    bus_order = _bfs_order_buses(center_bus_id, adjacency, result.buses)
+    # Use Kamada-Kawai layout (minimizes edge crossings)
+    try:
+        nx_positions = nx.kamada_kawai_layout(G, scale=SCALE)
+    except Exception:
+        # Fallback to spring layout
+        nx_positions = nx.spring_layout(G, scale=SCALE, seed=42)
 
-    # Position buses in 2D layout (horizontal + vertical for distant buses)
-    bus_positions = _position_buses_2d(bus_order, center_bus_id, adjacency)
+    # Convert NetworkX positions to our format and shift to positive coordinates
+    min_x = min(pos[0] for pos in nx_positions.values()) if nx_positions else 0
+    min_y = min(pos[1] for pos in nx_positions.values()) if nx_positions else 0
+
+    bus_positions: dict[str, dict[str, float]] = {}
+    for bus_id, (x, y) in nx_positions.items():
+        bus_positions[bus_id] = {
+            "x": (x - min_x) + SCALE / 2,  # Shift to positive, add padding
+            "y": (y - min_y) + SCALE / 2,
+        }
     positions.update(bus_positions)
 
     # Position substation groups around their buses
@@ -91,145 +106,6 @@ def _find_center_bus(result: ViewResult, adjacency: dict[str, list[str]]) -> str
         return max(result.buses, key=lambda b: len(adjacency.get(b.id, []))).id
 
     return result.buses[0].id if result.buses else ""
-
-
-def _bfs_order_buses(
-    center_id: str,
-    adjacency: dict[str, list[str]],
-    buses: list[BusModel],
-) -> list[str]:
-    """Order buses using BFS from center, alternating left/right."""
-    bus_ids = {b.id for b in buses}
-    visited = set()
-    order = []
-
-    # BFS from center
-    queue = [center_id] if center_id in bus_ids else []
-    while queue:
-        bus_id = queue.pop(0)
-        if bus_id in visited or bus_id not in bus_ids:
-            continue
-        visited.add(bus_id)
-        order.append(bus_id)
-
-        # Add neighbors
-        for neighbor in adjacency.get(bus_id, []):
-            if neighbor not in visited and neighbor in bus_ids:
-                queue.append(neighbor)
-
-    # Add any disconnected buses
-    for bus in buses:
-        if bus.id not in visited:
-            order.append(bus.id)
-
-    return order
-
-
-def _position_buses_2d(
-    bus_order: list[str],
-    center_id: str,
-    adjacency: dict[str, list[str]],
-) -> dict[str, dict[str, float]]:
-    """Position buses in 2D to minimize line crossings.
-
-    Strategy:
-    - Center bus in the middle
-    - Direct neighbors of center: alternate left/right on same row
-    - Buses 2+ hops away: place on rows above/below to avoid crossings
-    """
-    positions: dict[str, dict[str, float]] = {}
-
-    if not bus_order:
-        return positions
-
-    # Calculate center position
-    center_x = len(bus_order) * BUS_SPACING / 2
-    center_y = BUS_Y
-
-    # Track which buses are direct neighbors of center
-    center_neighbors = set(adjacency.get(center_id, []))
-
-    # Position center bus
-    if center_id in bus_order:
-        positions[center_id] = {"x": center_x, "y": center_y}
-
-    # Separate buses into categories
-    direct_neighbors = []
-    distant_buses = []
-
-    for bus_id in bus_order:
-        if bus_id == center_id:
-            continue
-        if bus_id in center_neighbors:
-            direct_neighbors.append(bus_id)
-        else:
-            distant_buses.append(bus_id)
-
-    # Position first 2 direct neighbors: left and right of center
-    # Additional neighbors go BELOW center to avoid crossings
-    horizontal_neighbors = direct_neighbors[:2]  # Max 2 on horizontal
-    vertical_neighbors = direct_neighbors[2:]    # Rest go below
-
-    # First neighbor goes right, second goes left
-    if len(horizontal_neighbors) >= 1:
-        positions[horizontal_neighbors[0]] = {
-            "x": center_x + BUS_SPACING,
-            "y": center_y,
-        }
-    if len(horizontal_neighbors) >= 2:
-        positions[horizontal_neighbors[1]] = {
-            "x": center_x - BUS_SPACING,
-            "y": center_y,
-        }
-
-    # Additional direct neighbors go below center
-    row_offset = BUS_SPACING
-    for i, bus_id in enumerate(vertical_neighbors):
-        positions[bus_id] = {
-            "x": center_x,
-            "y": center_y + row_offset * (i + 1),
-        }
-
-    # Position distant buses: place below their connected neighbor
-    placed_in_column: dict[float, int] = {}  # x -> count of buses in that column
-
-    # Initialize column counts for already placed buses
-    for bus_id, pos in positions.items():
-        x = pos["x"]
-        if pos["y"] > center_y:  # Already below main row
-            placed_in_column[x] = placed_in_column.get(x, 0) + 1
-
-    for bus_id in distant_buses:
-        # Find which positioned bus this one connects to
-        connected_to = None
-        for neighbor in adjacency.get(bus_id, []):
-            if neighbor in positions:
-                connected_to = neighbor
-                break
-
-        if connected_to:
-            # Place below the connected bus
-            parent_pos = positions[connected_to]
-            parent_x = parent_pos["x"]
-
-            # Track how many buses are already in this column
-            col_count = placed_in_column.get(parent_x, 0)
-            placed_in_column[parent_x] = col_count + 1
-
-            positions[bus_id] = {
-                "x": parent_x,
-                "y": center_y + row_offset * (col_count + 1),
-            }
-        else:
-            # No connection found - place below center
-            col_count = placed_in_column.get(center_x, 0)
-            placed_in_column[center_x] = col_count + 1
-            positions[bus_id] = {
-                "x": center_x,
-                "y": center_y + row_offset * (col_count + 1),
-            }
-
-    return positions
 
 
 def _position_substations(
