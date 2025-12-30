@@ -129,41 +129,46 @@ def _position_buses_horizontal(
     bus_order: list[str],
     center_id: str,
 ) -> dict[str, dict[str, float]]:
-    """Position buses on a horizontal line, center bus in middle."""
+    """Position buses on a horizontal line, center bus in middle.
+
+    Neighbors alternate left/right from center so that adjacent buses
+    in the graph are adjacent in the layout.
+    """
     positions: dict[str, dict[str, float]] = {}
 
     if not bus_order:
         return positions
 
-    # Find center index
-    try:
-        center_idx = bus_order.index(center_id)
-    except ValueError:
-        center_idx = 0
-
-    # Position center at x=0
+    # Position center at middle
     center_x = len(bus_order) * BUS_SPACING / 2
 
-    # Assign positions: center bus first, then alternate left/right
-    left_buses = bus_order[:center_idx]
-    right_buses = bus_order[center_idx + 1:]
+    # Center bus first
+    if center_id in bus_order:
+        positions[center_id] = {"x": center_x, "y": BUS_Y}
 
-    # Center bus
-    positions[center_id] = {"x": center_x, "y": BUS_Y}
+    # Get non-center buses in BFS order (neighbors first)
+    other_buses = [b for b in bus_order if b != center_id]
 
-    # Buses to the left of center
-    for i, bus_id in enumerate(reversed(left_buses)):
-        positions[bus_id] = {
-            "x": center_x - (i + 1) * BUS_SPACING,
-            "y": BUS_Y,
-        }
+    # Alternate left/right placement for neighbors
+    # This ensures directly connected buses are adjacent in layout
+    left_count = 0
+    right_count = 0
 
-    # Buses to the right of center
-    for i, bus_id in enumerate(right_buses):
-        positions[bus_id] = {
-            "x": center_x + (i + 1) * BUS_SPACING,
-            "y": BUS_Y,
-        }
+    for i, bus_id in enumerate(other_buses):
+        if i % 2 == 0:
+            # Even index -> right side
+            right_count += 1
+            positions[bus_id] = {
+                "x": center_x + right_count * BUS_SPACING,
+                "y": BUS_Y,
+            }
+        else:
+            # Odd index -> left side
+            left_count += 1
+            positions[bus_id] = {
+                "x": center_x - left_count * BUS_SPACING,
+                "y": BUS_Y,
+            }
 
     return positions
 
@@ -272,7 +277,8 @@ def _position_terminals(
 ) -> dict[str, dict[str, float]]:
     """Position terminal nodes along their parent bus.
 
-    Terminals are positioned on the bus bar itself (same Y as bus).
+    Terminals are spread vertically along the bus bar to prevent
+    lines from overlapping when they go to different destinations.
     """
     positions: dict[str, dict[str, float]] = {}
 
@@ -282,7 +288,7 @@ def _position_terminals(
         terminal_count[branch.from_bus_id] += 1
         terminal_count[branch.to_bus_id] += 1
 
-    # Generate terminal positions
+    # Generate terminal positions - spread vertically along bus
     terminal_index: dict[str, int] = defaultdict(int)
 
     for branch in result.branches:
@@ -292,11 +298,20 @@ def _position_terminals(
                 continue
 
             term_id = f"{bus_id}_term_{terminal_index[bus_id]}"
+            count = terminal_count[bus_id]
+            idx = terminal_index[bus_id]
 
-            # Terminal at same position as bus (will be refined by frontend)
+            # Spread terminals vertically along the bus bar
+            # Bus bar is ~50px tall, spread terminals within that
+            if count <= 1:
+                y_offset = 0
+            else:
+                spread = min(40, (count - 1) * 15)  # Max 40px spread
+                y_offset = -spread / 2 + idx * (spread / (count - 1))
+
             positions[term_id] = {
                 "x": bus_pos["x"],
-                "y": bus_pos["y"],
+                "y": bus_pos["y"] + y_offset,
             }
 
             terminal_index[bus_id] += 1
