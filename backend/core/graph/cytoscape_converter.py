@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import Any
 
 from backend.core.graph.models import ViewResult
+from backend.core.graph.layouts import compute_substation_layout
 
 
 def _count_bus_connections(result: ViewResult) -> dict[str, int]:
@@ -40,6 +41,9 @@ def view_result_to_cytoscape(result: ViewResult) -> dict[str, Any]:
         Dictionary with "elements" (nodes and edges) and "meta" keys,
         suitable for JSON serialization and Cytoscape.js consumption
     """
+    # Compute positions using substation-based layout
+    positions = compute_substation_layout(result)
+
     # In BUS mode, add substation nodes as compound parents (invisible containers)
     # This makes buses in the same substation cluster together in the layout
     view_mode = result.meta.get("mode", "bus")
@@ -66,15 +70,17 @@ def view_result_to_cytoscape(result: ViewResult) -> dict[str, Any]:
     if view_mode == "bus":
         for sub in result.substations:
             if sub.id in substation_ids_in_view:
-                nodes.append(
-                    {
-                        "data": {
-                            "id": sub.id,
-                            "kind": "substation_group",  # Invisible compound parent
-                            "name": sub.name,
-                        }
+                node_data: dict[str, Any] = {
+                    "data": {
+                        "id": sub.id,
+                        "kind": "substation_group",  # Invisible compound parent
+                        "name": sub.name,
                     }
-                )
+                }
+                # Add position if available
+                if sub.id in positions:
+                    node_data["position"] = positions[sub.id]
+                nodes.append(node_data)
 
     # Build bus_id to substation_id lookup for assigning parents to transformers/equipment
     bus_to_substation = {}
@@ -107,7 +113,11 @@ def view_result_to_cytoscape(result: ViewResult) -> dict[str, Any]:
         # Add connection count for dynamic bus sizing
         bus_data["connection_count"] = bus_connections.get(bus.id, 0)
 
-        nodes.append({"data": bus_data})
+        bus_node: dict[str, Any] = {"data": bus_data}
+        # Add position if available
+        if bus.id in positions:
+            bus_node["position"] = positions[bus.id]
+        nodes.append(bus_node)
 
         # Create terminal nodes for this bus (one per connection)
         num_terminals = bus_connections.get(bus.id, 0)
@@ -128,7 +138,11 @@ def view_result_to_cytoscape(result: ViewResult) -> dict[str, Any]:
             if view_mode == "bus" and bus.substation_id and bus.substation_id in substation_ids_in_view:
                 terminal_data["parent"] = bus.substation_id
 
-            nodes.append({"data": terminal_data})
+            terminal_node: dict[str, Any] = {"data": terminal_data}
+            # Add position if available
+            if terminal_id in positions:
+                terminal_node["position"] = positions[terminal_id]
+            nodes.append(terminal_node)
 
         bus_terminal_ids[bus.id] = terminal_ids
 
@@ -197,7 +211,11 @@ def view_result_to_cytoscape(result: ViewResult) -> dict[str, Any]:
                 transformer_data["parent"] = transformer_parent
 
             # Add transformer as a node
-            nodes.append({"data": transformer_data})
+            transformer_node: dict[str, Any] = {"data": transformer_data}
+            # Add position if available
+            if branch.id in positions:
+                transformer_node["position"] = positions[branch.id]
+            nodes.append(transformer_node)
 
             # Get terminals for from_bus and to_bus
             from_terminal = get_next_terminal(branch.from_bus_id)
@@ -261,8 +279,12 @@ def view_result_to_cytoscape(result: ViewResult) -> dict[str, Any]:
             eq_sub = bus_to_substation.get(eq.bus_id)
             if eq_sub and eq_sub in substation_ids_in_view:
                 equipment_data["parent"] = eq_sub
-        
-        nodes.append({"data": equipment_data})
+
+        equipment_node: dict[str, Any] = {"data": equipment_data}
+        # Add position if available
+        if eq.id in positions:
+            equipment_node["position"] = positions[eq.id]
+        nodes.append(equipment_node)
         # Add equipment_link edge from bus to equipment
         edges.append(
             {

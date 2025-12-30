@@ -876,44 +876,13 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
         // Dynamic equipment link styles (out-of-service = dashed)
         ...equipmentLinkStyles,
       ],
-      layout: Object.keys(cachedPositionsRef.current).length > 0
-        ? {
-            // Use cached positions (no layout calculation)
-            name: "preset",
-            positions: (nodeId: string) => {
-              const cached = cachedPositionsRef.current[nodeId];
-              return cached || { x: 0, y: 0 };
-            },
-            fit: false,
-            animate: false,
-          }
-        : {
-            // COSE force-directed layout
-            name: "cose",
-            animate: false,
-            nodeDimensionsIncludeLabels: true,
-            idealEdgeLength: (edge: cytoscape.EdgeSingular) => {
-              const kind = edge.data("kind");
-              const type = edge.data("type");
-              if (kind === "equipment_link") return 30;
-              if (kind === "transformer_link" || type === "xfmr" || type === "xfmr3") return 40;
-              return 150;
-            },
-            edgeElasticity: (edge: cytoscape.EdgeSingular) => {
-              const kind = edge.data("kind");
-              const type = edge.data("type");
-              if (kind === "transformer_link" || type === "xfmr" || type === "xfmr3") return 400;
-              if (kind === "equipment_link") return 50;
-              return 100;
-            },
-            nodeRepulsion: () => 10000,
-            gravity: 0.3,
-            numIter: 1000,
-            nestingFactor: 0.8,
-            randomize: false,
-            componentSpacing: 150,
-            padding: 30,
-          },
+      // Use preset layout - positions come from backend
+      // Backend computes substation-based layout
+      layout: {
+        name: "preset",
+        fit: true,
+        padding: 50,
+      },
       userPanningEnabled: true,
       userZoomingEnabled: true,
       boxSelectionEnabled: false,
