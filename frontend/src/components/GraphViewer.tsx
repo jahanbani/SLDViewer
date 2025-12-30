@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
-import cytoscape, { Core, NodeSingular, EdgeSingular } from "cytoscape";
+import cytoscape, { Core, NodeSingular, EdgeSingular, Position } from "cytoscape";
 import { GuidelineManager } from "../features/guidelines";
+import { EdgeRoutingManager } from "../features/edge-routing";
 
 // API base URL - uses Vite proxy in development, env vars in production
 const API_BASE_URL = import.meta.env.VITE_API_URL || "";
@@ -535,7 +536,16 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
   const [selectedElement, setSelectedElement] = useState<NodeData | EdgeData | null>(null);
   const [verticalBuses, setVerticalBuses] = useState<Set<string>>(new Set());
   const [showGuidelines, setShowGuidelines] = useState<boolean>(true);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    type: "edge" | "waypoint";
+    edgeId: string;
+    waypointId?: string;
+    position?: Position;
+  } | null>(null);
   const guidelinesRef = useRef<GuidelineManager | null>(null);
+  const edgeRoutingRef = useRef<EdgeRoutingManager | null>(null);
 
   // Use a ref for position caching to avoid triggering re-renders
   const cachedPositionsRef = useRef<Record<string, { x: number; y: number }>>({});
@@ -625,6 +635,11 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
       if (guidelinesRef.current) {
         guidelinesRef.current.destroy();
         guidelinesRef.current = null;
+      }
+      // Clean up edge routing manager
+      if (edgeRoutingRef.current) {
+        edgeRoutingRef.current.destroy();
+        edgeRoutingRef.current = null;
       }
       cyRef.current.destroy();
     }
@@ -936,6 +951,16 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
         snapThreshold: 8,
         showThreshold: 15,
       });
+
+      // Initialize edge routing manager
+      edgeRoutingRef.current = new EdgeRoutingManager({
+        enabled: true,
+        maxBends: 3,
+        gridSize: 10,
+        obstacleMargin: 15,
+        obstacleNodeKinds: ["bus", "transformer", "equipment", "substation"],
+      });
+      edgeRoutingRef.current.initialize(cy, containerRef.current);
     }
 
     // Make terminal nodes non-grabbable (they move with their bus)
@@ -966,6 +991,11 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
     repositionEquipment(cy, verticalBuses);
     // Optimize edge routing to avoid crossing through nodes
     optimizeEdgeRouting(cy);
+
+    // Auto-route all edges using the new multi-bend routing
+    if (edgeRoutingRef.current) {
+      edgeRoutingRef.current.autoRouteAll();
+    }
 
     // Grab handler for guidelines - notify when drag starts
     cy.on("grab", "node[kind='bus']", (evt) => {
@@ -1047,7 +1077,7 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
       const node = evt.target as NodeSingular;
       const busId = node.id();
       console.log("RIGHT-CLICK on bus - toggling orientation:", busId);
-      
+
       setVerticalBuses((prev) => {
         const newSet = new Set(prev);
         if (newSet.has(busId)) {
@@ -1056,6 +1086,31 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
           newSet.add(busId);
         }
         return newSet;
+      });
+    });
+
+    // Right-click handler for edges - show context menu to add bend point
+    cy.on("cxttap", "edge", (evt) => {
+      evt.preventDefault();
+      const edge = evt.target as EdgeSingular;
+      const kind = edge.data("kind");
+
+      // Only allow bend points on branch and transformer_link edges
+      if (kind !== "branch" && kind !== "transformer_link") return;
+
+      const originalEvt = evt.originalEvent as MouseEvent;
+      const containerRect = containerRef.current?.getBoundingClientRect();
+      if (!containerRect) return;
+
+      // Get the position in model coordinates where user clicked
+      const renderedPos = evt.position;
+
+      setContextMenu({
+        x: originalEvt.clientX,
+        y: originalEvt.clientY,
+        type: "edge",
+        edgeId: edge.id(),
+        position: { x: renderedPos.x, y: renderedPos.y },
       });
     });
 
@@ -1084,11 +1139,16 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
     // Cleanup on unmount
     return () => {
       if (cyRef.current) {
-      // Clean up guidelines manager
-      if (guidelinesRef.current) {
-        guidelinesRef.current.destroy();
-        guidelinesRef.current = null;
-      }
+        // Clean up guidelines manager
+        if (guidelinesRef.current) {
+          guidelinesRef.current.destroy();
+          guidelinesRef.current = null;
+        }
+        // Clean up edge routing manager
+        if (edgeRoutingRef.current) {
+          edgeRoutingRef.current.destroy();
+          edgeRoutingRef.current = null;
+        }
         cyRef.current.destroy();
         cyRef.current = null;
       }
@@ -1172,6 +1232,46 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
   const handleExpandFromBus = (psseNumber: number) => {
     setCenterBus(psseNumber);
   };
+
+  // Handle context menu actions
+  const handleAddBendPoint = useCallback(() => {
+    if (!contextMenu || !edgeRoutingRef.current || contextMenu.type !== "edge") return;
+
+    const { edgeId, position } = contextMenu;
+    if (!position) return;
+
+    edgeRoutingRef.current.addWaypoint(edgeId, position);
+    setContextMenu(null);
+  }, [contextMenu]);
+
+  const handleRemoveBendPoint = useCallback(() => {
+    if (!contextMenu || !edgeRoutingRef.current || contextMenu.type !== "waypoint") return;
+
+    const { edgeId, waypointId } = contextMenu;
+    if (!waypointId) return;
+
+    edgeRoutingRef.current.removeWaypoint(edgeId, waypointId);
+    setContextMenu(null);
+  }, [contextMenu]);
+
+  const handleClearWaypoints = useCallback(() => {
+    if (!contextMenu || !edgeRoutingRef.current) return;
+
+    edgeRoutingRef.current.clearWaypoints(contextMenu.edgeId);
+    setContextMenu(null);
+  }, [contextMenu]);
+
+  // Close context menu when clicking elsewhere
+  useEffect(() => {
+    const handleClickOutside = () => {
+      setContextMenu(null);
+    };
+
+    if (contextMenu) {
+      document.addEventListener("click", handleClickOutside);
+      return () => document.removeEventListener("click", handleClickOutside);
+    }
+  }, [contextMenu]);
 
   // Loading state
   if (loading) {
@@ -1399,6 +1499,84 @@ const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
             minHeight: "400px",
           }}
         />
+
+        {/* Context Menu for Edge Bend Points */}
+        {contextMenu && (
+          <div
+            style={{
+              position: "fixed",
+              left: contextMenu.x,
+              top: contextMenu.y,
+              background: "#fff",
+              border: "1px solid #ddd",
+              borderRadius: "6px",
+              boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
+              zIndex: 2000,
+              minWidth: "160px",
+              overflow: "hidden",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {contextMenu.type === "edge" && (
+              <>
+                <button
+                  onClick={handleAddBendPoint}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    padding: "10px 14px",
+                    border: "none",
+                    background: "none",
+                    textAlign: "left",
+                    cursor: "pointer",
+                    fontSize: "13px",
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = "#f0f0f0")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "none")}
+                >
+                  Add Bend Point
+                </button>
+                <button
+                  onClick={handleClearWaypoints}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    padding: "10px 14px",
+                    border: "none",
+                    background: "none",
+                    textAlign: "left",
+                    cursor: "pointer",
+                    fontSize: "13px",
+                    borderTop: "1px solid #eee",
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = "#f0f0f0")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "none")}
+                >
+                  Reset to Auto-Route
+                </button>
+              </>
+            )}
+            {contextMenu.type === "waypoint" && (
+              <button
+                onClick={handleRemoveBendPoint}
+                style={{
+                  display: "block",
+                  width: "100%",
+                  padding: "10px 14px",
+                  border: "none",
+                  background: "none",
+                  textAlign: "left",
+                  cursor: "pointer",
+                  fontSize: "13px",
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "#f0f0f0")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "none")}
+              >
+                Remove Bend Point
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Detail Panel */}
