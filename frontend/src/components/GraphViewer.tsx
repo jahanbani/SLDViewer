@@ -1,1595 +1,2029 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
-import cytoscape, { Core, NodeSingular, EdgeSingular } from "cytoscape";
-
-// API base URL - uses Vite proxy in development, env vars in production
-const API_BASE_URL = import.meta.env.VITE_API_URL || "";
-
-// Type definitions for API request/response
-type ViewMode = "bus" | "substation" | "station_detail";
-
-type ViewSpec = {
-  mode: ViewMode;
-  center_bus_numbers: number[] | null;
-  center_substation_ids: string[] | null;
-  degrees: number;
-  filters: {
-    include_equipment?: boolean;
-    equipment_types?: string[] | null;
-  };
-  layout: string;
-  limit: number | null;
-};
-
-type BusNodeData = {
-  id: string;
-  kind: "bus";
-  psse_number: number;
-  name: string;
-  base_kv: number;
-  substation_id: string | null;
-  area: number;
-  zone: number;
-  vm: number | null;
-  va: number | null;
-  vmax: number | null;
-  vmin: number | null;
-  owner: number;
-};
-
-type EquipmentNodeData = {
-  id: string;
-  kind: "equipment";
-  equipment_type: "generator" | "load" | "shunt" | "svc" | "statcom" | "vsc_converter" | "csc_converter" | "other";
-  bus_id: string;
-  name: string | null;
-  status: boolean | null;
-  p_mw: number | null;
-  q_mvar: number | null;
-  metadata: Record<string, unknown>;
-};
-
-type BranchEdgeData = {
-  id: string;
-  kind: "branch";
-  type: "line" | "xfmr" | "xfmr3" | "switch" | "dc_line" | "hvdc";
-  source: string;
-  target: string;
-  circuit: string;
-  r: number;
-  x: number;
-  b: number;
-  g: number;
-  r0: number | null;
-  x0: number | null;
-  b0: number | null;
-  rate_a: number | null;
-  rate_b: number | null;
-  rate_c: number | null;
-  rating_mva: number;
-  tap_module: number | null;
-  tap_phase: number | null;
-  length: number | null;
-  p_from_mw: number | null;
-  q_from_mvar: number | null;
-  p_to_mw: number | null;
-  q_to_mvar: number | null;
-};
-
-type EquipmentLinkData = {
-  id: string;
-  kind: "equipment_link";
-  source: string;
-  target: string;
-};
-
-type TransformerLinkData = {
-  id: string;
-  kind: "transformer_link";
-  source: string;
-  target: string;
-};
-
-type TransformerNodeData = {
-  id: string;
-  kind: "transformer";
-  type: "xfmr" | "xfmr3";
-  name: string;
-  circuit: string;
-  r: number;
-  x: number;
-  b: number;
-  g: number;
-  r0: number | null;
-  x0: number | null;
-  b0: number | null;
-  rate_a: number | null;
-  rate_b: number | null;
-  rate_c: number | null;
-  rating_mva: number;
-  tap_module: number | null;
-  tap_phase: number | null;
-  from_bus_id: string;
-  to_bus_id: string;
-};
-
-type SubstationNodeData = {
-  id: string;
-  kind: "substation" | "neighbor_substation_stub" | "substation_group";
-  name: string;
-  area?: number | null;
-  zone?: number | null;
-  nominal_kv?: number | null;
-  voltage_levels?: number[];
-  latitude?: number | null;
-  longitude?: number | null;
-};
-
-type NodeData = BusNodeData | EquipmentNodeData | TransformerNodeData | SubstationNodeData;
-type EdgeData = BranchEdgeData | EquipmentLinkData | TransformerLinkData;
-
-type CytoscapeNode = {
-  data: NodeData;
-};
-
-type CytoscapeEdge = {
-  data: EdgeData;
-};
-
-type ViewResponse = {
-  elements: {
-    nodes: CytoscapeNode[];
-    edges: CytoscapeEdge[];
-  };
-  meta: {
-    mode: string;
-    truncated: boolean;
-    node_count: number;
-    edge_count: number;
-    equipment_count?: number;
-    degrees: number;
-    limit: number;
-  };
-};
-
-type GraphViewerProps = {
-  fileId: string;
-};
-
-// Voltage-based color mapping for buses
-function getVoltageColor(baseKv: number): string {
-  if (baseKv >= 500) return "#e74c3c"; // Red - EHV
-  if (baseKv >= 345) return "#9b59b6"; // Purple
-  if (baseKv >= 230) return "#3498db"; // Blue
-  if (baseKv >= 115) return "#27ae60"; // Green
-  if (baseKv >= 69) return "#f39c12"; // Orange
-  return "#95a5a6"; // Gray - LV
-}
-
-// Equipment type styling
-const EQUIPMENT_STYLES: Record<string, { color: string; shape: string; label: string }> = {
-  generator: { color: "#2ecc71", shape: "triangle", label: "G" },
-  load: { color: "#e74c3c", shape: "diamond", label: "L" },
-  shunt: { color: "#9b59b6", shape: "rectangle", label: "SH" },
-  svc: { color: "#1abc9c", shape: "pentagon", label: "SVC" },
-  statcom: { color: "#16a085", shape: "hexagon", label: "ST" },
-  vsc_converter: { color: "#f39c12", shape: "octagon", label: "VSC" },
-  csc_converter: { color: "#d35400", shape: "octagon", label: "CSC" },
-  other: { color: "#7f8c8d", shape: "ellipse", label: "?" },
-};
-
-// Equipment positioning constants
-const EQUIPMENT_OFFSET = 60; // Distance from bus to first equipment (increased to avoid line overlap)
-const EQUIPMENT_SPACING = 30; // Spacing between equipment nodes (increased for better separation)
-
-// Constants for bus sizing
-const BUS_MIN_LENGTH = 40;  // Minimum bus length
-const BUS_TERMINAL_SPACING = 20;  // Spacing between terminals along the bus
-const BUS_THICKNESS = 12;  // Bus bar thickness (short dimension)
-
 /**
- * Reposition terminal nodes along their parent bus bar.
- * Terminals are positioned ONLY on the long sides of the bus:
- * - Vertical buses: terminals on LEFT and RIGHT sides
- * - Horizontal buses: terminals on TOP and BOTTOM sides
- *
- * This prevents lines from "sticking" along the bus edges.
- * Bus length is adjusted based on the number of connections.
+ * GraphViewer component for rendering Cytoscape.js diagrams.
  */
-function repositionTerminals(cy: Core, verticalBuses: Set<string>): void {
-  // Group terminals by their bus_id
-  const terminalsByBus = new Map<string, NodeSingular[]>();
+import { useEffect, useRef, useState, useCallback } from 'react';
+import cytoscape, { Core, ElementDefinition, NodeSingular, EdgeSingular } from 'cytoscape';
+import elk from 'cytoscape-elk';
+import {
+  generateView,
+  defaultViewSpec,
+  CytoscapePayload,
+  ViewSpec,
+  ApiError,
+} from '../utils/api';
+import { getSldStyles } from '../utils/sldStyles';
+import { runSldLayout, LayoutDirection, LayoutResult } from '../utils/sldLayout';
+import { recalculateEdgeRoutingForBus, recalculateEdgeRoutingOnly } from '../utils/edgeRouting';
+import {
+  applyDiagnostics,
+  getDiagnosticsInfo,
+  DEFAULT_DIAGNOSTICS,
+  DiagnosticsState,
+} from '../utils/diagnostics';
+import { useKeyboardShortcuts, getShortcutsList } from '../utils/useKeyboardShortcuts';
 
-  cy.nodes("[kind='terminal']").forEach((termNode) => {
-    const busId = termNode.data("bus_id") as string;
-    if (!terminalsByBus.has(busId)) {
-      terminalsByBus.set(busId, []);
-    }
-    terminalsByBus.get(busId)!.push(termNode);
-  });
-
-  // Position terminals along each bus
-  terminalsByBus.forEach((terminals, busId) => {
-    const busNode = cy.getElementById(busId);
-    if (busNode.empty()) return;
-
-    const busPos = busNode.position();
-    const isVertical = verticalBuses.has(busId);
-
-    // Separate terminals into two sides (long sides only)
-    // For vertical buses: LEFT and RIGHT
-    // For horizontal buses: TOP and BOTTOM
-    const side1Terminals: NodeSingular[] = [];  // Left (vertical) or Top (horizontal)
-    const side2Terminals: NodeSingular[] = [];  // Right (vertical) or Bottom (horizontal)
-
-    terminals.forEach((termNode) => {
-      // Find the edge connected to this terminal
-      const connectedEdges = termNode.connectedEdges();
-      if (connectedEdges.empty()) {
-        side1Terminals.push(termNode);
-        return;
-      }
-
-      // Get the other end of the edge
-      const edge = connectedEdges.first();
-      const sourceId = edge.data("source");
-      const targetId = edge.data("target");
-      const otherId = sourceId === termNode.id() ? targetId : sourceId;
-      const otherNode = cy.getElementById(otherId);
-
-      if (otherNode.empty()) {
-        side1Terminals.push(termNode);
-        return;
-      }
-
-      const otherPos = otherNode.position();
-
-      if (isVertical) {
-        // Vertical bus: terminals on LEFT or RIGHT based on X position
-        if (otherPos.x < busPos.x) {
-          side1Terminals.push(termNode);  // Left side
-        } else {
-          side2Terminals.push(termNode);  // Right side
-        }
-      } else {
-        // Horizontal bus: terminals on TOP or BOTTOM based on Y position
-        if (otherPos.y < busPos.y) {
-          side1Terminals.push(termNode);  // Top side
-        } else {
-          side2Terminals.push(termNode);  // Bottom side
-        }
-      }
-    });
-
-    // Sort terminals by the position of their connected node along the bus axis
-    const sortByOtherAlongBus = (a: NodeSingular, b: NodeSingular) => {
-      const getOtherPos = (term: NodeSingular) => {
-        const edge = term.connectedEdges().first();
-        if (!edge) return 0;
-        const sourceId = edge.data("source");
-        const targetId = edge.data("target");
-        const otherId = sourceId === term.id() ? targetId : sourceId;
-        const other = cy.getElementById(otherId);
-        if (other.empty()) return 0;
-        // For vertical bus, sort by Y; for horizontal bus, sort by X
-        return isVertical ? other.position().y : other.position().x;
-      };
-      return getOtherPos(a) - getOtherPos(b);
-    };
-
-    side1Terminals.sort(sortByOtherAlongBus);
-    side2Terminals.sort(sortByOtherAlongBus);
-
-    // Calculate bus length based on max terminals on either side
-    const maxTerminalsOnOneSide = Math.max(side1Terminals.length, side2Terminals.length, 1);
-    const busLength = Math.max(BUS_MIN_LENGTH, maxTerminalsOnOneSide * BUS_TERMINAL_SPACING);
-    const busHalfLength = busLength / 2;
-    const busHalfThickness = BUS_THICKNESS / 2;
-
-    // Update bus size
-    if (isVertical) {
-      busNode.style({
-        width: BUS_THICKNESS,
-        height: busLength,
-      });
-    } else {
-      busNode.style({
-        width: busLength,
-        height: BUS_THICKNESS,
-      });
-    }
-
-    // Helper to calculate position along the bus
-    const calcOffset = (idx: number, count: number) => {
-      if (count <= 1) return 0;
-      // Spread terminals evenly along the bus, with some margin from ends
-      const margin = 5;
-      const usableLength = busLength - 2 * margin;
-      return -usableLength / 2 + margin + (idx / (count - 1)) * (usableLength - 2 * margin);
-    };
-
-    // Position side1 terminals (Left for vertical, Top for horizontal)
-    side1Terminals.forEach((termNode, idx) => {
-      const offset = calcOffset(idx, side1Terminals.length);
-
-      if (isVertical) {
-        // Left side of vertical bus
-        termNode.position({
-          x: busPos.x - busHalfThickness,
-          y: busPos.y + offset,
-        });
-        termNode.scratch("_busOffset", { x: -busHalfThickness, y: offset });
-      } else {
-        // Top side of horizontal bus
-        termNode.position({
-          x: busPos.x + offset,
-          y: busPos.y - busHalfThickness,
-        });
-        termNode.scratch("_busOffset", { x: offset, y: -busHalfThickness });
-      }
-    });
-
-    // Position side2 terminals (Right for vertical, Bottom for horizontal)
-    side2Terminals.forEach((termNode, idx) => {
-      const offset = calcOffset(idx, side2Terminals.length);
-
-      if (isVertical) {
-        // Right side of vertical bus
-        termNode.position({
-          x: busPos.x + busHalfThickness,
-          y: busPos.y + offset,
-        });
-        termNode.scratch("_busOffset", { x: busHalfThickness, y: offset });
-      } else {
-        // Bottom side of horizontal bus
-        termNode.position({
-          x: busPos.x + offset,
-          y: busPos.y + busHalfThickness,
-        });
-        termNode.scratch("_busOffset", { x: offset, y: busHalfThickness });
-      }
-    });
-  });
+// Register ELK layout (only once)
+try {
+  cytoscape.use(elk);
+} catch {
+  // Already registered
 }
 
-/**
- * Reposition equipment nodes to be close to their parent bus.
- * For horizontal buses: equipment arranged in a row below the bus.
- * For vertical buses: equipment arranged in a column to the right of the bus.
- */
-function repositionEquipment(cy: Core, verticalBuses: Set<string>): void {
-  // Get all equipment nodes grouped by their bus_id
-  const equipmentByBus = new Map<string, NodeSingular[]>();
-
-  cy.nodes("[kind='equipment']").forEach((eqNode) => {
-    const busId = eqNode.data("bus_id") as string;
-    if (!equipmentByBus.has(busId)) {
-      equipmentByBus.set(busId, []);
-    }
-    equipmentByBus.get(busId)!.push(eqNode);
-  });
-
-  // For each bus, position its equipment
-  equipmentByBus.forEach((equipmentNodes, busId) => {
-    const busNode = cy.getElementById(busId);
-    if (busNode.empty()) return;
-
-    const busPos = busNode.position();
-    const numEquipment = equipmentNodes.length;
-    const isVertical = verticalBuses.has(busId);
-
-    // Get current bus dimensions (set by repositionTerminals)
-    const busWidth = busNode.style("width") ? parseFloat(busNode.style("width")) : BUS_MIN_LENGTH;
-    const busHeight = busNode.style("height") ? parseFloat(busNode.style("height")) : BUS_MIN_LENGTH;
-
-    if (isVertical) {
-      // Vertical bus: equipment in a column to the right
-      const totalHeight = (numEquipment - 1) * EQUIPMENT_SPACING;
-      const startY = busPos.y - totalHeight / 2;
-
-      equipmentNodes.forEach((eqNode, index) => {
-        const offsetX = busWidth / 2 + EQUIPMENT_OFFSET;
-        const offsetY = startY + index * EQUIPMENT_SPACING - busPos.y;
-
-        eqNode.position({
-          x: busPos.x + offsetX,
-          y: startY + index * EQUIPMENT_SPACING,
-        });
-
-        // Store offset for drag handler
-        eqNode.scratch("_offset", { x: offsetX, y: offsetY });
-      });
-    } else {
-      // Horizontal bus: equipment in a row below
-      const totalWidth = (numEquipment - 1) * EQUIPMENT_SPACING;
-      const startX = busPos.x - totalWidth / 2;
-
-      equipmentNodes.forEach((eqNode, index) => {
-        const offsetX = startX + index * EQUIPMENT_SPACING - busPos.x;
-        const offsetY = busHeight / 2 + EQUIPMENT_OFFSET;
-
-        eqNode.position({
-          x: startX + index * EQUIPMENT_SPACING,
-          y: busPos.y + offsetY,
-        });
-
-        // Store offset for drag handler
-        eqNode.scratch("_offset", { x: offsetX, y: offsetY });
-      });
-    }
-  });
+interface GraphViewerProps {
+  fileId: string | null;
+  centerBusNumber: number | null;
+  onNodeSelect?: (nodeId: string, data: Record<string, unknown>) => void;
+  onEdgeSelect?: (edgeId: string, data: Record<string, unknown>) => void;
 }
 
-// Spacing between parallel routing channels to prevent line overlap
-const CHANNEL_SPACING = 20;
-// Base turn distance from source for taxi routing
-const BASE_TURN_DISTANCE = 40;
-
-/**
- * Optimize edge routing to prevent overlapping and sticking to buses.
- *
- * Rules:
- * 1. All line angles must be 90 degrees (orthogonal)
- * 2. No line should stick to a bus (run parallel along its edge)
- * 3. No lines should overlap for more than a few pixels
- * 4. Distribute terminals on BOTH sides of the bus to prevent overlap
- *
- * Solution:
- * - Distribute edges across left/right (or top/bottom) sides of the bus
- * - taxi-direction based on which SIDE the terminal is on
- * - Different taxi-turn values for edges on the same side
- */
-function optimizeEdgeRouting(cy: Core, verticalBuses: Set<string>): void {
-  // Group edges by their source bus
-  const edgesBySourceBus = new Map<string, cytoscape.EdgeSingular[]>();
-
-  cy.edges().forEach((edge) => {
-    const kind = edge.data("kind");
-    if (kind !== "branch" && kind !== "transformer_link") return;
-
-    const sourceNode = edge.source();
-    const sourceBusId = sourceNode.data("bus_id") as string || sourceNode.id();
-
-    if (!edgesBySourceBus.has(sourceBusId)) {
-      edgesBySourceBus.set(sourceBusId, []);
-    }
-    edgesBySourceBus.get(sourceBusId)!.push(edge);
-  });
-
-  // Process edges from each bus
-  edgesBySourceBus.forEach((edges, sourceBusId) => {
-    const sourceIsVertical = verticalBuses.has(sourceBusId);
-
-    // For vertical bus: distribute on LEFT and RIGHT sides based on target X position
-    // For horizontal bus: distribute on TOP and BOTTOM sides based on target Y position
-    const side1Edges: cytoscape.EdgeSingular[] = [];  // Left (vertical) or Top (horizontal)
-    const side2Edges: cytoscape.EdgeSingular[] = [];  // Right (vertical) or Bottom (horizontal)
-
-    // Get bus position to determine which side each edge should use
-    const busNode = cy.getElementById(sourceBusId);
-    const busPos = busNode.empty() ? null : busNode.position();
-
-    edges.forEach((edge) => {
-      const targetPos = edge.target().position();
-
-      if (sourceIsVertical) {
-        // Vertical bus: distribute based on target X relative to bus X
-        // If target is left of bus → use left side; if right → use right side
-        if (busPos && targetPos.x < busPos.x) {
-          side1Edges.push(edge);  // Left side
-        } else {
-          side2Edges.push(edge);  // Right side
-        }
-      } else {
-        // Horizontal bus: distribute based on target Y relative to bus Y
-        // If target is above bus → use top side; if below → use bottom side
-        if (busPos && targetPos.y < busPos.y) {
-          side1Edges.push(edge);  // Top side
-        } else {
-          side2Edges.push(edge);  // Bottom side
-        }
-      }
-    });
-
-    // Sort edges on each side by secondary position for consistent channel assignment
-    const sortByPosition = (a: cytoscape.EdgeSingular, b: cytoscape.EdgeSingular, useX: boolean) => {
-      const aTarget = a.target().position();
-      const bTarget = b.target().position();
-      return useX ? aTarget.x - bTarget.x : aTarget.y - bTarget.y;
-    };
-
-    if (sourceIsVertical) {
-      // Sort by Y position (so closer targets get inner channels)
-      side1Edges.sort((a, b) => sortByPosition(a, b, false));
-      side2Edges.sort((a, b) => sortByPosition(a, b, false));
-    } else {
-      // Sort by X position
-      side1Edges.sort((a, b) => sortByPosition(a, b, true));
-      side2Edges.sort((a, b) => sortByPosition(a, b, true));
-    }
-
-    // Apply taxi routing based on which side the edge exits from
-    const applyTaxiRouting = (
-      edgeGroup: cytoscape.EdgeSingular[],
-      taxiDirection: string
-    ) => {
-      const numEdges = edgeGroup.length;
-      if (numEdges === 0) return;
-
-      edgeGroup.forEach((edge, index) => {
-        // Each edge gets a different taxi-turn value to create separate channels
-        const turnDistance = BASE_TURN_DISTANCE + index * CHANNEL_SPACING;
-
-        edge.style({
-          "curve-style": "taxi",
-          "taxi-direction": taxiDirection,
-          "taxi-turn": turnDistance,
-          "taxi-turn-min-distance": 10,
-        });
-      });
-    };
-
-    // Apply routing: side determines direction
-    if (sourceIsVertical) {
-      // Left side → go leftward first; Right side → go rightward first
-      applyTaxiRouting(side1Edges, "leftward");
-      applyTaxiRouting(side2Edges, "rightward");
-    } else {
-      // Top side → go upward first; Bottom side → go downward first
-      applyTaxiRouting(side1Edges, "upward");
-      applyTaxiRouting(side2Edges, "downward");
-    }
-  });
+// Selected bus state for resize control
+interface SelectedBusState {
+  id: string;
+  name: string;
+  psseNumber: number;
+  currentLength: number;
+  orientation: 'vertical' | 'horizontal';
 }
 
-const GraphViewer: React.FC<GraphViewerProps> = ({ fileId }) => {
+export function GraphViewer({ fileId, centerBusNumber, onNodeSelect, onEdgeSelect }: GraphViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const cyRef = useRef<Core | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [elements, setElements] = useState<ViewResponse["elements"] | null>(null);
-  const [meta, setMeta] = useState<ViewResponse["meta"] | null>(null);
-  const [viewMode, setViewMode] = useState<ViewMode>("bus");
-  const [centerBus, setCenterBus] = useState<number | null>(null);
-  const [degrees, setDegrees] = useState<number>(1);
-  const [showEquipment, setShowEquipment] = useState<boolean>(true);
-  const [showSubstationGroups, setShowSubstationGroups] = useState<boolean>(true);
-  const [selectedElement, setSelectedElement] = useState<NodeData | EdgeData | null>(null);
-  const [verticalBuses, setVerticalBuses] = useState<Set<string>>(new Set());
+  const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
+  const [displayDepth, setDisplayDepth] = useState(2);
+  const [layoutDirection, setLayoutDirection] = useState<LayoutDirection>('AUTO');
+  const [layoutResult, setLayoutResult] = useState<LayoutResult | null>(null);
+  const [dataVersion, setDataVersion] = useState(0); // Incremented on each data load
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsState>(DEFAULT_DIAGNOSTICS);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [lockEquipmentToBus, setLockEquipmentToBus] = useState(true);
+  const lockEquipmentRef = useRef(true);
 
-  // Use a ref for position caching to avoid triggering re-renders
-  const cachedPositionsRef = useRef<Record<string, { x: number; y: number }>>({});
+  // 17.18: Edit Mode - controls element grabbability
+  const [editMode, setEditMode] = useState(false);
+  const editModeRef = useRef(false);
 
-  // Ref to track showSubstationGroups for initial render (avoids adding to dependency array)
-  const showSubstationGroupsRef = useRef(showSubstationGroups);
-  showSubstationGroupsRef.current = showSubstationGroups;
+  // Box selection state (Shift+Drag for zoom, Ctrl+Drag for multi-select)
+  const [boxSelectActive, setBoxSelectActive] = useState(false);
+  const [boxSelectMode, setBoxSelectMode] = useState<'zoom' | 'select'>('zoom');
+  const [boxStart, setBoxStart] = useState<{ x: number; y: number } | null>(null);
+  const [boxEnd, setBoxEnd] = useState<{ x: number; y: number } | null>(null);
+  const boxOverlayRef = useRef<HTMLDivElement>(null);
 
-  // Fetch graph view from API
-  const fetchView = useCallback(async (
-    id: string,
-    mode: ViewMode,
-    nextCenterBus: number | null,
-    nextDegrees: number,
-    includeEquipment: boolean
-  ) => {
-    setLoading(true);
-    setError(null);
+  // Multi-select state
+  const [multiSelectActive, setMultiSelectActive] = useState(false);
 
-    const viewSpec: ViewSpec = {
-      mode: mode,
-      center_bus_numbers: mode === "bus" && nextCenterBus != null ? [nextCenterBus] : null,
-      center_substation_ids: null,
-      degrees: nextDegrees,
-      filters: {
-        // In substation mode, equipment is not shown (overview mode)
-        include_equipment: mode === "substation" ? false : includeEquipment,
-      },
-      layout: "preset",
-      limit: null,
-    };
+  // Grid overlay state
+  const [showGrid, setShowGrid] = useState(false);
+  const [snapToGrid, setSnapToGrid] = useState(false);
+  const snapToGridRef = useRef(false);
+  const gridSize = 20; // Grid spacing in pixels
 
-    try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/v1/graphs/${id}/view`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(viewSpec),
-        }
-      );
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(
-          errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`
-        );
-      }
-
-      const data: ViewResponse = await response.json();
-      setElements(data.elements);
-      setMeta(data.meta);
-
-      // DON'T clear cached positions - preserve positions for nodes that still exist
-      // This allows incremental layout when degrees changes (1→2 keeps existing buses in place)
-
-      // Set all buses to VERTICAL by default
-      const busIds = data.elements.nodes
-        .filter((n) => n.data.kind === "bus")
-        .map((n) => n.data.id);
-      setVerticalBuses(new Set(busIds));
-    } catch (err) {
-      const errorMessage =
-        err instanceof Error ? err.message : "Failed to load graph view";
-      setError(errorMessage);
-      console.error("Error fetching graph view:", err);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  // Initialize Cytoscape
+  // Keep snap ref in sync with state
   useEffect(() => {
-    if (!containerRef.current || !elements) {
-      return;
-    }
+    snapToGridRef.current = snapToGrid;
+  }, [snapToGrid]);
 
-    // Save current positions before destroying instance (for layout caching)
-    if (cyRef.current) {
-      cyRef.current.nodes().forEach((node) => {
-        const pos = node.position();
-        cachedPositionsRef.current[node.id()] = { x: pos.x, y: pos.y };
-      });
-      cyRef.current.destroy();
-    }
+  // Selected bus state for resize control
+  const [selectedBus, setSelectedBus] = useState<SelectedBusState | null>(null);
 
-    // Build dynamic styles based on voltage levels in the data
-    const busStyles = elements.nodes
-      .filter((n) => n.data.kind === "bus")
-      .map((n) => {
-        const bus = n.data as BusNodeData;
-        return {
-          selector: `node[id="${bus.id}"]`,
-          style: {
-            "background-color": getVoltageColor(bus.base_kv),
-          },
-        };
-      });
+  // Context menu state
+  interface ContextMenuState {
+    visible: boolean;
+    x: number;
+    y: number;
+    busId: string;
+    busNumber: number;
+    busName: string;
+  }
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [expandDepthInput, setExpandDepthInput] = useState<number>(2);
+  const [showExpandDialog, setShowExpandDialog] = useState(false);
+  // Store expansion target bus info separately so it persists when context menu closes
+  const [expandTargetBus, setExpandTargetBus] = useState<{ id: string; number: number; name: string } | null>(null);
 
-    // Build equipment styles (including out-of-service styling)
-    const equipmentStyles = elements.nodes
-      .filter((n) => n.data.kind === "equipment")
-      .map((n) => {
-        const eq = n.data as EquipmentNodeData;
-        const style = EQUIPMENT_STYLES[eq.equipment_type] || EQUIPMENT_STYLES.other;
-        const isOutOfService = eq.status === false;
-        return {
-          selector: `node[id="${eq.id}"]`,
-          style: {
-            "background-color": style.color,
-            shape: style.shape as cytoscape.Css.NodeShape,
-            // Out-of-service: dashed border and reduced opacity
-            ...(isOutOfService ? {
-              "border-style": "dashed" as const,
-              opacity: 0.5,
-            } : {}),
-          },
-        };
-      });
-
-    // Build equipment link styles (solid for in-service, dashed for out-of-service)
-    const equipmentLinkStyles = elements.edges
-      .filter((e) => e.data.kind === "equipment_link")
-      .filter((e) => (e.data as { status?: boolean }).status === false)
-      .map((e) => ({
-        selector: `edge[id="${e.data.id}"]`,
-        style: {
-          "line-style": "dashed" as const,
-          opacity: 0.5,
-        },
-      }));
-
-    // Always include all nodes - substation visibility is controlled via style, not filtering
-    // This prevents recreating the entire graph when toggling substations
-    const filteredNodes = elements.nodes;
-
-    // Initialize Cytoscape
-    const cy = cytoscape({
-      container: containerRef.current,
-      elements: {
-        nodes: filteredNodes,
-        edges: elements.edges,
-      },
-      style: [
-        // Base node style
-        {
-          selector: "node",
-          style: {
-            label: "data(name)",
-            "text-valign": "bottom",
-            "text-halign": "center",
-            "font-size": 10,
-            width: 24,
-            height: 24,
-            "background-color": "#666",
-            "border-width": 2,
-            "border-color": "#333",
-          },
-        },
-        // Bus nodes - rectangular bar shape (size set dynamically by repositionTerminals)
-        {
-          selector: "node[kind='bus']",
-          style: {
-            shape: "round-rectangle",
-            width: BUS_THICKNESS,  // Will be overridden for horizontal buses
-            height: BUS_MIN_LENGTH,  // Will be overridden based on connection count
-            "text-valign": "top",
-            "text-margin-y": -4,
-            label: (ele: NodeSingular) => {
-              const data = ele.data() as BusNodeData;
-              return `${data.psse_number}\n${data.name}`;
-            },
-            "text-wrap": "wrap",
-            "font-size": 9,
-          },
-        },
-        // Equipment nodes - smaller
-        {
-          selector: "node[kind='equipment']",
-          style: {
-            width: 18,
-            height: 18,
-            "font-size": 8,
-            "border-width": 1,
-            label: (ele: NodeSingular) => {
-              const data = ele.data() as EquipmentNodeData;
-              const style = EQUIPMENT_STYLES[data.equipment_type] || EQUIPMENT_STYLES.other;
-              return style.label;
-            },
-            "text-valign": "center",
-            "text-halign": "center",
-            color: "#fff",
-            "text-outline-width": 0,
-          },
-        },
-        // Transformer nodes - distinctive symbol (two circles / coils)
-        {
-          selector: "node[kind='transformer']",
-          style: {
-            shape: "ellipse",
-            width: 28,
-            height: 28,
-            "background-color": "#8e44ad",
-            "border-width": 3,
-            "border-color": "#5b2c6f",
-            label: "T",
-            "text-valign": "center",
-            "text-halign": "center",
-            color: "#fff",
-            "font-size": 10,
-            "font-weight": "bold",
-          },
-        },
-        // Substation group nodes (compound parents) - minimal styling, just for grouping
-        {
-          selector: "node[kind='substation_group']",
-          style: {
-            shape: "round-rectangle",
-            "background-color": "rgba(52, 73, 94, 0.1)", // Very light background
-            "background-opacity": 0.3,
-            "border-width": 1,
-            "border-color": "rgba(52, 73, 94, 0.3)",
-            "border-style": "dashed",
-            label: "data(name)",
-            "text-valign": "top",
-            "text-halign": "center",
-            color: "#34495e",
-            "font-size": 9,
-            "text-opacity": 0.7,
-            padding: "10px",
-          },
-        },
-        // Substation nodes - larger rounded rectangle (for substation mode)
-        {
-          selector: "node[kind='substation']",
-          style: {
-            shape: "round-rectangle",
-            width: 100,
-            height: 50,
-            "background-color": "#2c3e50",
-            "border-width": 2,
-            "border-color": "#1a252f",
-            label: "data(name)",
-            "text-valign": "center",
-            "text-halign": "center",
-            color: "#fff",
-            "font-size": 12,
-            "font-weight": "bold",
-            "text-wrap": "wrap",
-            "text-max-width": "90px",
-          },
-        },
-        // Neighbor substation stubs - smaller, dashed border
-        {
-          selector: "node[kind='neighbor_substation_stub']",
-          style: {
-            shape: "round-rectangle",
-            width: 80,
-            height: 40,
-            "background-color": "#7f8c8d",
-            "border-width": 2,
-            "border-color": "#5a6268",
-            "border-style": "dashed",
-            label: "data(name)",
-            "text-valign": "center",
-            "text-halign": "center",
-            color: "#fff",
-            "font-size": 10,
-            "text-wrap": "wrap",
-            "text-max-width": "70px",
-          },
-        },
-        // Terminal nodes - invisible connection points along bus bars
-        {
-          selector: "node[kind='terminal']",
-          style: {
-            shape: "ellipse",
-            width: 4,
-            height: 4,
-            "background-color": "#2c3e50",
-            "border-width": 0,
-            label: "",  // No label
-            opacity: 0,  // Invisible - just connection points
-          },
-        },
-        // Base edge style - orthogonal taxi routing (90° angles only)
-        // taxi-turn set dynamically by optimizeEdgeRouting for parallel channels
-        {
-          selector: "edge",
-          style: {
-            width: 2,
-            "line-color": "#34495e",
-            "curve-style": "taxi",
-            "taxi-direction": "auto",
-            "taxi-turn": 40,
-            "taxi-turn-min-distance": 10,
-          },
-        },
-        // Branch edges - transmission lines (same taxi routing)
-        {
-          selector: "edge[kind='branch'][type='line']",
-          style: {
-            "line-color": "#34495e",
-            width: 2,
-          },
-        },
-        // Transformer link edges - also orthogonal
-        {
-          selector: "edge[kind='transformer_link']",
-          style: {
-            "line-color": "#8e44ad",
-            width: 2,
-            "line-style": "solid",
-          },
-        },
-        // Equipment link edges - straight lines (very short connections)
-        {
-          selector: "edge[kind='equipment_link']",
-          style: {
-            width: 1,
-            "line-color": "#7f8c8d",
-            "line-style": "solid",
-            opacity: 0.8,
-            "curve-style": "straight", // Equipment links are short, keep straight
-          },
-        },
-        // Selected/highlighted
-        {
-          selector: ":selected",
-          style: {
-            "border-color": "#e74c3c",
-            "border-width": 3,
-            "line-color": "#e74c3c",
-          },
-        },
-        // Dynamic bus colors
-        ...busStyles,
-        // Dynamic equipment styles
-        ...equipmentStyles,
-        // Dynamic equipment link styles (out-of-service = dashed)
-        ...equipmentLinkStyles,
-      ],
-      // Use preset layout - positions come from backend
-      // Backend computes substation-based layout
-      layout: {
-        name: "preset",
-        fit: true,
-        padding: 50,
-      },
-      userPanningEnabled: true,
-      userZoomingEnabled: true,
-      boxSelectionEnabled: false,
-    });
-
-    // Store reference
-    cyRef.current = cy;
-
-    // Make terminal nodes non-grabbable (they move with their bus)
-    cy.nodes("[kind='terminal']").ungrabify();
-
-    // Set initial substation visibility (avoids flicker on first load)
-    // Use ref to avoid adding showSubstationGroups to dependency array
-    if (!showSubstationGroupsRef.current) {
-      cy.batch(() => {
-        cy.nodes("[kind='substation_group']").style("display", "none");
-        // Move all nodes out of compound parents
-        cy.nodes("[kind='bus']").forEach((busNode) => {
-          if (busNode.parent().length > 0) {
-            busNode.move({ parent: null });
-          }
-        });
-        cy.nodes("[kind='terminal']").forEach((termNode) => {
-          if (termNode.parent().length > 0) {
-            termNode.move({ parent: null });
-          }
-        });
-        cy.nodes("[kind='equipment']").forEach((eqNode) => {
-          if (eqNode.parent().length > 0) {
-            eqNode.move({ parent: null });
-          }
-        });
-        cy.nodes("[kind='transformer']").forEach((xfNode) => {
-          if (xfNode.parent().length > 0) {
-            xfNode.move({ parent: null });
-          }
-        });
-      });
-    }
-
-    // Reposition terminal nodes along bus bars
-    repositionTerminals(cy, verticalBuses);
-
-    // Reposition equipment nodes to be close to their parent bus
-    repositionEquipment(cy, verticalBuses);
-    // Optimize edge routing based on bus orientations
-    optimizeEdgeRouting(cy, verticalBuses);
-
-    // Add drag listener: when bus is dragged, move equipment and terminals with it
-    cy.on("drag", "node[kind='bus']", (evt) => {
-      const bus = evt.target;
-      const busId = bus.id();
-      const busPos = bus.position();
-
-      // Move all terminals attached to this bus
-      cy.nodes("[kind='terminal']").forEach((termNode) => {
-        if (termNode.data("bus_id") === busId) {
-          const offset = termNode.scratch("_busOffset") || { x: 0, y: 0 };
-          termNode.position({
-            x: busPos.x + offset.x,
-            y: busPos.y + offset.y,
-          });
-        }
-      });
-
-      // Move all equipment attached to this bus
-      cy.nodes("[kind='equipment']").forEach((eqNode) => {
-        if (eqNode.data("bus_id") === busId) {
-          const offset = eqNode.scratch("_offset") || { x: 0, y: 60 };
-          eqNode.position({
-            x: busPos.x + offset.x,
-            y: busPos.y + offset.y,
-          });
-        }
-      });
-    });
-
-    // Node click handler (single click = select)
-    cy.on("tap", "node", (evt) => {
-      const node = evt.target as NodeSingular;
-      const data = node.data() as NodeData;
-      console.log("NODE TAP EVENT - setting selectedElement:", data.kind, data.id);
-      setSelectedElement(data);
-
-      // Log based on node type
-      if (data.kind === "bus") {
-        console.log("Bus clicked:", data);
-      } else if (data.kind === "equipment") {
-        console.log("Equipment clicked:", data);
-      } else if (data.kind === "transformer") {
-        console.log("Transformer clicked:", data);
-      }
-    });
-
-    // Right-click handler for bus rotation toggle (frees left-click for selection)
-    cy.on("cxttap", "node[kind='bus']", (evt) => {
-      evt.preventDefault(); // Prevent browser context menu
-      const node = evt.target as NodeSingular;
-      const busId = node.id();
-      console.log("RIGHT-CLICK on bus - toggling orientation:", busId);
-      
-      setVerticalBuses((prev) => {
-        const newSet = new Set(prev);
-        if (newSet.has(busId)) {
-          newSet.delete(busId);
-        } else {
-          newSet.add(busId);
-        }
-        return newSet;
-      });
-    });
-
-    // Edge click handler - handle branch edges
-    cy.on("tap", "edge", (evt) => {
-      const edge = evt.target as EdgeSingular;
-      const data = edge.data() as EdgeData;
-      console.log("EDGE TAP EVENT:", data.kind, data.id);
-      // Only show detail panel for branch edges (lines), not for connector edges
-      if (data.kind === "branch") {
-        setSelectedElement(data);
-        console.log("Branch clicked:", data);
-      }
-      // transformer_link and equipment_link are just connectors - don't show detail panel
-    });
-
-    // Background click clears selection
-    cy.on("tap", (evt) => {
-      // Only clear selection if we clicked on the background (not a node or edge)
-      if (evt.target === cy) {
-        console.log("BACKGROUND TAP - clearing selection");
-        setSelectedElement(null);
-      }
-    });
-
-    // Cleanup on unmount
-    return () => {
-      if (cyRef.current) {
-        cyRef.current.destroy();
-        cyRef.current = null;
-      }
-    };
-  }, [elements]); // showSubstationGroups removed - handled by separate effect
-
-  // Toggle substation group visibility without recreating the graph
+  // Keep refs in sync with state
   useEffect(() => {
+    lockEquipmentRef.current = lockEquipmentToBus;
+  }, [lockEquipmentToBus]);
+
+  // 17.18: Edit Mode sync and grabbability control
+  useEffect(() => {
+    editModeRef.current = editMode;
     const cy = cyRef.current;
     if (!cy) return;
 
-    cy.batch(() => {
-      const substationGroups = cy.nodes("[kind='substation_group']");
+    if (editMode) {
+      // Edit Mode ON: Enable grabbing for buses, terminals, equipment, transformers
+      cy.nodes('[kind="bus"], [kind="transformer"], [kind="transformer2"], [kind="transformer3"], [kind="terminal"], [kind="equipment"]').grabify();
+    } else {
+      // Edit Mode OFF: Disable grabbing for all editable elements
+      cy.nodes('[kind="bus"], [kind="transformer"], [kind="transformer2"], [kind="transformer3"], [kind="terminal"], [kind="equipment"]').ungrabify();
+    }
+  }, [editMode]);
 
-      if (showSubstationGroups) {
-        // Show substation groups
-        substationGroups.style("display", "element");
+  // Initialize Cytoscape
+  useEffect(() => {
+    if (!containerRef.current) return;
 
-        // Restore parent references for buses, terminals, equipment, and transformers
-        cy.nodes("[kind='bus']").forEach((busNode) => {
-          const substationId = busNode.data("substation_id");
-          if (substationId) {
-            const parentNode = cy.getElementById(substationId);
-            if (!parentNode.empty() && parentNode.data("kind") === "substation_group") {
-              busNode.move({ parent: substationId });
-            }
-          }
-        });
-        cy.nodes("[kind='terminal']").forEach((termNode) => {
-          const busId = termNode.data("bus_id");
-          const busNode = cy.getElementById(busId);
-          if (!busNode.empty()) {
-            const substationId = busNode.data("substation_id");
-            if (substationId) {
-              const parentNode = cy.getElementById(substationId);
-              if (!parentNode.empty() && parentNode.data("kind") === "substation_group") {
-                termNode.move({ parent: substationId });
-              }
-            }
-          }
-        });
-        // Restore parent for equipment
-        cy.nodes("[kind='equipment']").forEach((eqNode) => {
-          const busId = eqNode.data("bus_id");
-          const busNode = cy.getElementById(busId);
-          if (!busNode.empty()) {
-            const substationId = busNode.data("substation_id");
-            if (substationId) {
-              const parentNode = cy.getElementById(substationId);
-              if (!parentNode.empty() && parentNode.data("kind") === "substation_group") {
-                eqNode.move({ parent: substationId });
-              }
-            }
-          }
-        });
-        // Restore parent for transformers
-        cy.nodes("[kind='transformer']").forEach((xfNode) => {
-          const storedParent = xfNode.data("parent");
-          if (storedParent) {
-            const parentNode = cy.getElementById(storedParent);
-            if (!parentNode.empty() && parentNode.data("kind") === "substation_group") {
-              xfNode.move({ parent: storedParent });
-            }
-          }
-        });
+    const cy = cytoscape({
+      container: containerRef.current,
+      style: getSldStyles(),
+      layout: { name: 'preset' },
+      minZoom: 0.05,
+      maxZoom: 10,
+      wheelSensitivity: 1.5, // Higher = faster zoom with scroll wheel
+    });
+
+    // Node selection handler with multi-select support (Ctrl+Click)
+    cy.on('tap', 'node', (evt) => {
+      const node = evt.target;
+      const originalEvent = evt.originalEvent as MouseEvent;
+      const isCtrlClick = originalEvent.ctrlKey || originalEvent.metaKey;
+
+      if (isCtrlClick) {
+        // Multi-select: toggle selection state
+        if (node.selected()) {
+          node.unselect();
+        } else {
+          node.select();
+        }
+        setMultiSelectActive(cy.$(':selected').length > 1);
+        setSelectedBus(null); // Disable bus resize panel in multi-select mode
       } else {
-        // Hide substation groups
-        substationGroups.style("display", "none");
+        // Single select: deselect all others first
+        cy.$(':selected').unselect();
+        node.select();
+        setMultiSelectActive(false);
 
-        // Remove parent references (move all nodes out of compound nodes)
-        cy.nodes("[kind='bus']").forEach((busNode) => {
-          if (busNode.parent().length > 0) {
-            busNode.move({ parent: null });
+        if (onNodeSelect) {
+          onNodeSelect(node.id(), node.data());
+        }
+        // Track selected bus for resize control
+        if (node.data('kind') === 'bus') {
+          const orientation = node.data('orientation') || 'vertical';
+          const currentLength = orientation === 'horizontal'
+            ? (node.style('width') ? parseFloat(node.style('width')) : node.data('busbarLength') || 60)
+            : (node.style('height') ? parseFloat(node.style('height')) : node.data('busbarLength') || 60);
+          setSelectedBus({
+            id: node.id(),
+            name: node.data('label') || node.data('name') || node.id(),
+            psseNumber: node.data('psse_number') || 0,
+            currentLength,
+            orientation,
+          });
+        } else {
+          setSelectedBus(null);
+        }
+      }
+    });
+
+    // Edge selection handler
+    cy.on('tap', 'edge', (evt) => {
+      const edge = evt.target;
+      if (onEdgeSelect) {
+        onEdgeSelect(edge.id(), edge.data());
+      }
+      setSelectedBus(null);
+    });
+
+    // Right-click context menu for buses
+    cy.on('cxttap', 'node[kind="bus"]', (evt) => {
+      const node = evt.target;
+      const originalEvent = evt.originalEvent as MouseEvent;
+
+      // Get position relative to the graph wrapper
+      const container = containerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+
+      setContextMenu({
+        visible: true,
+        x: originalEvent.clientX - rect.left,
+        y: originalEvent.clientY - rect.top,
+        busId: node.id(),
+        busNumber: node.data('psse_number') || 0,
+        busName: node.data('label') || node.data('name') || node.id(),
+      });
+
+      originalEvent.preventDefault();
+    });
+
+    // Background click deselects bus and clears multi-select
+    cy.on('tap', (evt) => {
+      if (evt.target === cy) {
+        setSelectedBus(null);
+        setMultiSelectActive(false);
+        setContextMenu(null);
+        cy.$(':selected').unselect();
+      }
+    });
+
+    // Track position before drag starts - includes multi-select support
+    cy.on('grab', 'node[kind="bus"]', (evt) => {
+      const bus = evt.target;
+      bus.data('_dragStartX', bus.position('x'));
+      bus.data('_dragStartY', bus.position('y'));
+
+      // Store child node positions for this bus
+      const busId = bus.id();
+      cy.nodes(`[parentBusId="${busId}"], [busId="${busId}"]`).forEach((node) => {
+        node.data('_dragStartX', node.position('x'));
+        node.data('_dragStartY', node.position('y'));
+      });
+
+      // If part of multi-select, store start positions for ALL selected buses and their children
+      const selectedBuses = cy.nodes('[kind="bus"]:selected');
+      if (selectedBuses.length > 1 && bus.selected()) {
+        selectedBuses.forEach((otherBus) => {
+          if (otherBus.id() !== bus.id()) {
+            otherBus.data('_dragStartX', otherBus.position('x'));
+            otherBus.data('_dragStartY', otherBus.position('y'));
+            // Store children positions
+            const otherBusId = otherBus.id();
+            cy.nodes(`[parentBusId="${otherBusId}"], [busId="${otherBusId}"]`).forEach((node) => {
+              node.data('_dragStartX', node.position('x'));
+              node.data('_dragStartY', node.position('y'));
+            });
           }
         });
-        cy.nodes("[kind='terminal']").forEach((termNode) => {
-          if (termNode.parent().length > 0) {
-            termNode.move({ parent: null });
+
+        // Also store transformer positions for group move
+        cy.nodes('[kind="transformer"], [kind="transformer2"], [kind="transformer3"]:selected').forEach((xfmr) => {
+          xfmr.data('_dragStartX', xfmr.position('x'));
+          xfmr.data('_dragStartY', xfmr.position('y'));
+        });
+      }
+    });
+
+    // Move connected terminals and equipment when bus is dragged (with multi-select support)
+    cy.on('drag', 'node[kind="bus"]', (evt) => {
+      const bus = evt.target;
+      const startX = bus.data('_dragStartX') ?? bus.position('x');
+      const startY = bus.data('_dragStartY') ?? bus.position('y');
+      const deltaX = bus.position('x') - startX;
+      const deltaY = bus.position('y') - startY;
+
+      // Helper function to move a bus and its children
+      const moveBusAndChildren = (targetBus: NodeSingular, dx: number, dy: number) => {
+        const targetBusId = targetBus.id();
+
+        // Move child nodes if equipment is locked
+        if (lockEquipmentRef.current) {
+          cy.nodes(`[parentBusId="${targetBusId}"], [busId="${targetBusId}"]`).forEach((node) => {
+            const nodeStartX = node.data('_dragStartX');
+            const nodeStartY = node.data('_dragStartY');
+            if (nodeStartX !== undefined && nodeStartY !== undefined) {
+              node.position({ x: nodeStartX + dx, y: nodeStartY + dy });
+            }
+          });
+        }
+      };
+
+      // Move this bus's children
+      moveBusAndChildren(bus, deltaX, deltaY);
+
+      // If part of multi-select, move all other selected buses too
+      const selectedBuses = cy.nodes('[kind="bus"]:selected');
+      if (selectedBuses.length > 1 && bus.selected()) {
+        selectedBuses.forEach((otherBus) => {
+          if (otherBus.id() !== bus.id()) {
+            const otherStartX = otherBus.data('_dragStartX');
+            const otherStartY = otherBus.data('_dragStartY');
+            if (otherStartX !== undefined && otherStartY !== undefined) {
+              otherBus.position({ x: otherStartX + deltaX, y: otherStartY + deltaY });
+              moveBusAndChildren(otherBus, deltaX, deltaY);
+            }
           }
         });
-        cy.nodes("[kind='equipment']").forEach((eqNode) => {
-          if (eqNode.parent().length > 0) {
-            eqNode.move({ parent: null });
+
+        // Also move selected transformers
+        cy.nodes('[kind="transformer"]:selected, [kind="transformer2"]:selected, [kind="transformer3"]:selected').forEach((xfmr) => {
+          const xfmrStartX = xfmr.data('_dragStartX');
+          const xfmrStartY = xfmr.data('_dragStartY');
+          if (xfmrStartX !== undefined && xfmrStartY !== undefined) {
+            xfmr.position({ x: xfmrStartX + deltaX, y: xfmrStartY + deltaY });
           }
         });
-        cy.nodes("[kind='transformer']").forEach((xfNode) => {
-          if (xfNode.parent().length > 0) {
-            xfNode.move({ parent: null });
+      }
+
+      // 17.47: Recalculate edge routing dynamically during drag
+      // This updates taxi_turn and taxi_direction for connected edges
+      // enabling V-H-V routing when buses become vertically stacked
+      recalculateEdgeRoutingForBus(cy, bus.id());
+
+      // If multi-select, also recalculate for other moved buses
+      if (selectedBuses.length > 1 && bus.selected()) {
+        selectedBuses.forEach((otherBus) => {
+          if (otherBus.id() !== bus.id()) {
+            recalculateEdgeRoutingForBus(cy, otherBus.id());
           }
         });
       }
     });
-  }, [showSubstationGroups]);
 
-  // Update bus orientation and reposition terminals/equipment when verticalBuses changes
-  useEffect(() => {
-    if (cyRef.current) {
-      repositionTerminals(cyRef.current, verticalBuses);
-      repositionEquipment(cyRef.current, verticalBuses);
-      optimizeEdgeRouting(cyRef.current, verticalBuses);
-    }
-  }, [verticalBuses]);
+    // Terminal drag along bus - constrain movement to bus axis with side-switching support
+    cy.on('grab', 'node[kind="terminal"]', (evt) => {
+      const terminal = evt.target;
+      terminal.data('_dragStartX', terminal.position('x'));
+      terminal.data('_dragStartY', terminal.position('y'));
+      terminal.data('_isDraggingTerminal', true);
 
-  // Fetch view when fileId or parameters change
+      // Store the parent bus info for constraint
+      const parentBusId = terminal.data('parentBusId');
+      if (parentBusId) {
+        const parentBus = cy.getElementById(parentBusId);
+        if (parentBus.length > 0) {
+          const busPos = parentBus.position();
+          const busLength = parentBus.data('busbarLength') || 60;
+          terminal.data('_busX', busPos.x);
+          terminal.data('_busY', busPos.y);
+          terminal.data('_busLength', busLength);
+          terminal.data('_busMinY', busPos.y - busLength / 2);
+          terminal.data('_busMaxY', busPos.y + busLength / 2);
+        }
+      }
+    });
+
+    cy.on('drag', 'node[kind="terminal"]', (evt) => {
+      const terminal = evt.target;
+      if (!terminal.data('_isDraggingTerminal')) return;
+
+      const busMinY = terminal.data('_busMinY');
+      const busMaxY = terminal.data('_busMaxY');
+      const busX = terminal.data('_busX');
+      const busThickness = 8;
+
+      if (busMinY !== undefined && busMaxY !== undefined && busX !== undefined) {
+        const currentPos = terminal.position();
+        const constrainedY = Math.max(busMinY, Math.min(busMaxY, currentPos.y));
+
+        // ENHANCED: Allow side-switching based on drag X position
+        // If terminal is dragged past bus center, switch to other side
+        const isLeftSide = currentPos.x < busX;
+        const terminalX = isLeftSide
+          ? busX - busThickness / 2 - 2   // LEFT side
+          : busX + busThickness / 2 + 2;  // RIGHT side
+
+        terminal.position({ x: terminalX, y: constrainedY });
+        terminal.data('attachSide', isLeftSide ? 'LEFT' : 'RIGHT');
+
+        // Move connected equipment with terminal (maintaining relative offset)
+        const connectedEdges = terminal.connectedEdges('[kind="equipment_link"]');
+        connectedEdges.forEach((edge: EdgeSingular) => {
+          const equipmentId = edge.data('target');
+          const equipment = cy.getElementById(equipmentId);
+          if (equipment.length > 0 && equipment.data('kind') === 'equipment') {
+            const equipmentOffset = 25; // Should match EQUIPMENT_OFFSET in sldLayout.ts
+            const equipmentX = isLeftSide
+              ? terminalX - equipmentOffset  // Further left
+              : terminalX + equipmentOffset; // Further right
+            equipment.position({ x: equipmentX, y: constrainedY });
+            equipment.data('attachSide', isLeftSide ? 'LEFT' : 'RIGHT');
+          }
+        });
+      }
+    });
+
+    cy.on('free', 'node[kind="terminal"]', (evt) => {
+      const terminal = evt.target;
+      if (!terminal.data('_isDraggingTerminal')) return;
+
+      // Redistribute terminals on both sides to handle side-switching
+      const parentBusId = terminal.data('parentBusId');
+
+      if (parentBusId) {
+        const parentBus = cy.getElementById(parentBusId);
+        if (parentBus.length > 0) {
+          const busPos = parentBus.position();
+          const busLength = parentBus.data('busbarLength') || 60;
+          const busThickness = 8;
+          const equipmentOffset = 25;
+
+          // Redistribute BOTH sides to handle side-switching
+          const redistributeSide = (isLeft: boolean) => {
+            const allTerminals = cy.nodes(`[kind="terminal"][parentBusId="${parentBusId}"]`);
+            const sideTerminals: NodeSingular[] = [];
+            allTerminals.forEach((t: NodeSingular) => {
+              const tX = t.position('x');
+              if (isLeft ? tX < busPos.x : tX >= busPos.x) {
+                sideTerminals.push(t);
+              }
+            });
+            sideTerminals.sort((a, b) => a.position('y') - b.position('y'));
+
+            if (sideTerminals.length > 0) {
+              // Use margin from bus edges (8px default)
+              const terminalEdgeMargin = 8;
+              const usableLength = busLength - 2 * terminalEdgeMargin;
+              const spacing = usableLength / (sideTerminals.length + 1);
+              const xOffset = isLeft ? -busThickness / 2 - 2 : busThickness / 2 + 2;
+
+              sideTerminals.forEach((t, idx) => {
+                const newY = busPos.y - busLength / 2 + terminalEdgeMargin + spacing * (idx + 1);
+                t.position({ x: busPos.x + xOffset, y: newY });
+
+                // Also move connected equipment with correct X position for this side
+                const eqEdges = t.connectedEdges('[kind="equipment_link"]');
+                eqEdges.forEach((eqEdge: EdgeSingular) => {
+                  const eqId = eqEdge.data('target');
+                  const eq = cy.getElementById(eqId);
+                  if (eq.length > 0 && eq.data('kind') === 'equipment') {
+                    const eqX = isLeft
+                      ? busPos.x + xOffset - equipmentOffset
+                      : busPos.x + xOffset + equipmentOffset;
+                    eq.position({ x: eqX, y: newY });
+                    eq.data('attachSide', isLeft ? 'LEFT' : 'RIGHT');
+                  }
+                });
+              });
+            }
+          };
+
+          // Redistribute both sides
+          redistributeSide(true);  // LEFT
+          redistributeSide(false); // RIGHT
+        }
+      }
+
+      // Clean up drag data
+      terminal.removeData('_dragStartY');
+      terminal.removeData('_dragStartX');
+      terminal.removeData('_isDraggingTerminal');
+      terminal.removeData('_busX');
+      terminal.removeData('_busY');
+      terminal.removeData('_busLength');
+      terminal.removeData('_busMinY');
+      terminal.removeData('_busMaxY');
+
+      // 17.47: Recalculate edge routing after terminal position changes
+      // IMPORTANT: Use recalculateEdgeRoutingOnly to NOT reposition other terminals
+      if (parentBusId) {
+        recalculateEdgeRoutingOnly(cy, parentBusId);
+      }
+    });
+
+    // Double-click on terminal to flip it to the other side of the bus
+    cy.on('dbltap', 'node[kind="terminal"]', (evt) => {
+      const terminal = evt.target;
+      const parentBusId = terminal.data('parentBusId');
+
+      if (!parentBusId) return;
+
+      const parentBus = cy.getElementById(parentBusId);
+      if (parentBus.length === 0) return;
+
+      const busPos = parentBus.position();
+      const termPos = terminal.position();
+      const busThickness = 8; // From config
+      const equipmentOffset = 40; // From config
+
+      // Determine current side and flip to the opposite
+      const isCurrentlyLeft = termPos.x < busPos.x;
+      const newXOffset = isCurrentlyLeft ? busThickness / 2 + 2 : -busThickness / 2 - 2;
+      const newX = busPos.x + newXOffset;
+
+      // Move terminal to the other side
+      terminal.position({ x: newX, y: termPos.y });
+
+      // Also move connected equipment to the new side
+      const connectedEdges = terminal.connectedEdges('[kind="equipment_link"]');
+      connectedEdges.forEach((edge: EdgeSingular) => {
+        const equipmentId = edge.data('target');
+        const equipment = cy.getElementById(equipmentId);
+        if (equipment.length > 0 && equipment.data('kind') === 'equipment') {
+          // Equipment goes on same side as terminal, further out
+          const side = isCurrentlyLeft ? 1 : -1; // Flipping side
+          const equipmentX = newX + side * (equipmentOffset - busThickness / 2);
+          equipment.position({ x: equipmentX, y: termPos.y });
+        }
+      });
+
+      // Redistribute terminals on both sides to even spacing
+      const redistributeTerminals = (side: 'left' | 'right') => {
+        const isLeft = side === 'left';
+        const allTerminals = cy.nodes(`[kind="terminal"][parentBusId="${parentBusId}"]`);
+        const sideTerminals: NodeSingular[] = [];
+
+        allTerminals.forEach((t: NodeSingular) => {
+          const tX = t.position('x');
+          if (isLeft ? tX < busPos.x : tX >= busPos.x) {
+            sideTerminals.push(t);
+          }
+        });
+
+        if (sideTerminals.length === 0) return;
+
+        sideTerminals.sort((a, b) => a.position('y') - b.position('y'));
+
+        const busLength = parentBus.data('busbarLength') || 60;
+        // Use margin from bus edges (8px default)
+        const terminalEdgeMargin = 8;
+        const usableLength = busLength - 2 * terminalEdgeMargin;
+        const spacing = usableLength / (sideTerminals.length + 1);
+        const xOffset = isLeft ? -busThickness / 2 - 2 : busThickness / 2 + 2;
+
+        sideTerminals.forEach((t, idx) => {
+          const newY = busPos.y - busLength / 2 + terminalEdgeMargin + spacing * (idx + 1);
+          t.position({ x: busPos.x + xOffset, y: newY });
+
+          // Also reposition connected equipment
+          const edges = t.connectedEdges('[kind="equipment_link"]');
+          edges.forEach((edge: EdgeSingular) => {
+            const eqId = edge.data('target');
+            const eq = cy.getElementById(eqId);
+            if (eq.length > 0 && eq.data('kind') === 'equipment') {
+              const eqSide = isLeft ? -1 : 1;
+              const eqX = busPos.x + xOffset + eqSide * (equipmentOffset - busThickness / 2);
+              eq.position({ x: eqX, y: newY });
+            }
+          });
+        });
+      };
+
+      // Redistribute both sides after the flip
+      redistributeTerminals('left');
+      redistributeTerminals('right');
+
+      // 17.47: Recalculate edge routing after terminal flip
+      // Use recalculateEdgeRoutingOnly to avoid further terminal repositioning
+      recalculateEdgeRoutingOnly(cy, parentBusId);
+    });
+
+    // Equipment drag handler - moves terminal with equipment to maintain perpendicular connection
+    // Allows switching to the opposite side of the bus based on drag position
+    cy.on('drag', 'node[kind="equipment"]', (evt) => {
+      const equipment = evt.target;
+      const equipmentPos = equipment.position();
+
+      // Find connected terminal via equipment_link edge
+      const connectedEdges = equipment.connectedEdges('[kind="equipment_link"]');
+      if (connectedEdges.length === 0) return;
+
+      const edge = connectedEdges[0];
+      const terminalId = edge.data('source');
+      const terminal = cy.getElementById(terminalId);
+      if (terminal.length === 0) return;
+
+      const parentBusId = terminal.data('parentBusId');
+      if (!parentBusId) return;
+
+      const parentBus = cy.getElementById(parentBusId);
+      if (parentBus.length === 0) return;
+
+      const busPos = parentBus.position();
+      const busLength = parentBus.data('busbarLength') || 60;
+      const busThickness = 8;
+      const busMinY = busPos.y - busLength / 2;
+      const busMaxY = busPos.y + busLength / 2;
+
+      // Constrain equipment Y to bus bounds
+      const constrainedY = Math.max(busMinY, Math.min(busMaxY, equipmentPos.y));
+
+      // Determine which side based on where the user is dragging the equipment
+      // If equipment is dragged to the left of bus center, put it on left side
+      // If equipment is dragged to the right of bus center, put it on right side
+      const isLeftSide = equipmentPos.x < busPos.x;
+
+      // Calculate terminal and equipment X positions
+      const terminalX = isLeftSide
+        ? busPos.x - busThickness / 2 - 2  // LEFT side of bus
+        : busPos.x + busThickness / 2 + 2; // RIGHT side of bus
+      const equipmentOffset = 25; // Should match EQUIPMENT_OFFSET in sldLayout.ts
+      const equipmentX = isLeftSide
+        ? terminalX - equipmentOffset  // Further left
+        : terminalX + equipmentOffset; // Further right
+
+      // Update both positions - terminal and equipment at SAME Y for perpendicular line
+      terminal.position({ x: terminalX, y: constrainedY });
+      equipment.position({ x: equipmentX, y: constrainedY });
+
+      // Update attachSide data for proper symbol orientation
+      equipment.data('attachSide', isLeftSide ? 'LEFT' : 'RIGHT');
+    });
+
+    // Equipment free handler - redistribute terminals on the same side to enforce slot positions
+    cy.on('free', 'node[kind="equipment"]', (evt) => {
+      const equipment = evt.target;
+
+      // Find connected terminal
+      const connectedEdges = equipment.connectedEdges('[kind="equipment_link"]');
+      if (connectedEdges.length === 0) return;
+
+      const edge = connectedEdges[0];
+      const terminalId = edge.data('source');
+      const terminal = cy.getElementById(terminalId);
+      if (terminal.length === 0) return;
+
+      const parentBusId = terminal.data('parentBusId');
+      if (!parentBusId) return;
+
+      const parentBus = cy.getElementById(parentBusId);
+      if (parentBus.length === 0) return;
+
+      const busPos = parentBus.position();
+      const termX = terminal.position('x');
+      const isLeftSide = termX < busPos.x;
+
+      // Get all terminals on the same side of this bus and redistribute them
+      const allTerminals = cy.nodes(`[kind="terminal"][parentBusId="${parentBusId}"]`);
+      const sameSideTerminals: NodeSingular[] = [];
+      allTerminals.forEach((t: NodeSingular) => {
+        const tX = t.position('x');
+        if (isLeftSide ? tX < busPos.x : tX >= busPos.x) {
+          sameSideTerminals.push(t);
+        }
+      });
+
+      // Sort by current Y position to preserve relative order
+      sameSideTerminals.sort((a, b) => a.position('y') - b.position('y'));
+
+      // Redistribute terminals evenly along the bus (discrete slot positions)
+      if (sameSideTerminals.length > 0) {
+        const busLength = parentBus.data('busbarLength') || 60;
+        // Use margin from bus edges (8px default)
+        const terminalEdgeMargin = 8;
+        const usableLength = busLength - 2 * terminalEdgeMargin;
+        const spacing = usableLength / (sameSideTerminals.length + 1);
+        const busThickness = 8;
+        const equipmentOffset = 25;
+
+        sameSideTerminals.forEach((t, idx) => {
+          const newY = busPos.y - busLength / 2 + terminalEdgeMargin + spacing * (idx + 1);
+          const xOffset = isLeftSide ? -busThickness / 2 - 2 : busThickness / 2 + 2;
+          t.position({ x: busPos.x + xOffset, y: newY });
+
+          // Also move connected equipment to maintain perpendicular connection
+          const eqEdges = t.connectedEdges('[kind="equipment_link"]');
+          eqEdges.forEach((eqEdge: EdgeSingular) => {
+            const eqId = eqEdge.data('target');
+            const eq = cy.getElementById(eqId);
+            if (eq.length > 0 && eq.data('kind') === 'equipment') {
+              const eqX = isLeftSide
+                ? busPos.x + xOffset - equipmentOffset
+                : busPos.x + xOffset + equipmentOffset;
+              eq.position({ x: eqX, y: newY });
+            }
+          });
+        });
+      }
+
+      // Recalculate edge routing after redistribution
+      recalculateEdgeRoutingOnly(cy, parentBusId);
+    });
+
+    // Clean up drag data after release and optionally snap to grid
+    cy.on('free', 'node[kind="bus"]', (evt) => {
+      const bus = evt.target;
+      const busId = bus.id();
+
+      // Helper to snap a position to grid
+      const snapPos = (pos: { x: number; y: number }) => {
+        if (!snapToGridRef.current) return pos;
+        const gridSz = 20; // Must match gridSize
+        return {
+          x: Math.round(pos.x / gridSz) * gridSz,
+          y: Math.round(pos.y / gridSz) * gridSz,
+        };
+      };
+
+      // Helper to snap a bus and move its children accordingly
+      const snapBusAndChildren = (targetBus: NodeSingular) => {
+        if (!snapToGridRef.current) return;
+        const targetBusId = targetBus.id();
+        const oldPos = targetBus.position();
+        const newPos = snapPos(oldPos);
+        const dx = newPos.x - oldPos.x;
+        const dy = newPos.y - oldPos.y;
+
+        targetBus.position(newPos);
+
+        // Also move children by the same delta
+        if (lockEquipmentRef.current) {
+          cy.nodes(`[parentBusId="${targetBusId}"], [busId="${targetBusId}"]`).forEach((node) => {
+            const nodePos = node.position();
+            node.position({ x: nodePos.x + dx, y: nodePos.y + dy });
+          });
+        }
+      };
+
+      // Snap this bus to grid
+      snapBusAndChildren(bus);
+
+      // Clean up drag data
+      bus.removeData('_dragStartX');
+      bus.removeData('_dragStartY');
+      // Note: terminals use parentBusId, equipment uses busId
+      cy.nodes(`[parentBusId="${busId}"], [busId="${busId}"]`).forEach((node) => {
+        node.removeData('_dragStartX');
+        node.removeData('_dragStartY');
+      });
+
+      // Clean up and snap for all selected buses if multi-select
+      const selectedBuses = cy.nodes('[kind="bus"]:selected');
+      if (selectedBuses.length > 1) {
+        selectedBuses.forEach((otherBus) => {
+          if (otherBus.id() !== bus.id()) {
+            snapBusAndChildren(otherBus);
+          }
+          otherBus.removeData('_dragStartX');
+          otherBus.removeData('_dragStartY');
+          const otherBusId = otherBus.id();
+          cy.nodes(`[parentBusId="${otherBusId}"], [busId="${otherBusId}"]`).forEach((node) => {
+            node.removeData('_dragStartX');
+            node.removeData('_dragStartY');
+          });
+        });
+
+        cy.nodes('[kind="transformer"]:selected, [kind="transformer2"]:selected, [kind="transformer3"]:selected').forEach((xfmr) => {
+          // Snap transformers to grid too
+          if (snapToGridRef.current) {
+            const gridSz = 20;
+            const pos = xfmr.position();
+            xfmr.position({
+              x: Math.round(pos.x / gridSz) * gridSz,
+              y: Math.round(pos.y / gridSz) * gridSz,
+            });
+          }
+          xfmr.removeData('_dragStartX');
+          xfmr.removeData('_dragStartY');
+        });
+      }
+    });
+
+
+    cyRef.current = cy;
+
+    return () => {
+      cy.destroy();
+      cyRef.current = null;
+    };
+  }, [onNodeSelect, onEdgeSelect]);
+
+  // Load view when fileId or centerBusNumber changes
   useEffect(() => {
-    if (!fileId) {
-      setError("No file ID provided");
-      setLoading(false);
+    if (!fileId || centerBusNumber === null) {
       return;
     }
-    fetchView(fileId, viewMode, centerBus, degrees, showEquipment);
-  }, [fileId, viewMode, centerBus, degrees, showEquipment, fetchView]);
 
-  // Handle clicking "Expand from here" in detail panel
-  const handleExpandFromBus = (psseNumber: number) => {
-    setCenterBus(psseNumber);
+    const loadView = async () => {
+      setLoading(true);
+      setError(null);
+      console.log('%c[GraphViewer] ===== LOAD VIEW STARTING =====', 'color: purple; font-weight: bold');
+      const totalStart = performance.now();
+
+      try {
+        const spec: ViewSpec = defaultViewSpec({
+          mode: 'bus',
+          center_bus_numbers: [centerBusNumber],
+          max_depth: 2, // Start with small depth to enable incremental expansion
+        });
+
+        const apiStart = performance.now();
+        const payload = await generateView(fileId, spec);
+        console.log(`%c[TIMING] API generateView: ${(performance.now() - apiStart).toFixed(1)}ms`, 'color: #0066cc; font-weight: bold');
+        console.log(`%c[TIMING] Payload: ${payload.elements.nodes.length} nodes, ${payload.elements.edges.length} edges`, 'color: orange');
+
+        const renderStart = performance.now();
+        await renderPayload(payload, centerBusNumber);
+        console.log(`%c[TIMING] renderPayload: ${(performance.now() - renderStart).toFixed(1)}ms`, 'color: #0066cc; font-weight: bold');
+
+        setMeta(payload.meta);
+        console.log(`%c[GraphViewer] ===== LOAD VIEW COMPLETE: ${(performance.now() - totalStart).toFixed(1)}ms =====`, 'color: purple; font-weight: bold');
+      } catch (err) {
+        if (err instanceof ApiError) {
+          setError(`${err.code}: ${err.message}`);
+        } else {
+          setError('Failed to load view');
+        }
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadView();
+  }, [fileId, centerBusNumber]);
+
+  // Update visibility based on displayDepth (also runs when dataVersion changes)
+  useEffect(() => {
+    if (!cyRef.current) return;
+
+    const cy = cyRef.current;
+
+    // First pass: Hide/show buses based on bfs_depth
+    cy.nodes('[kind="bus"]').forEach((node) => {
+      const depth = node.data('bfs_depth');
+      if (depth !== undefined && depth > displayDepth) {
+        node.addClass('hidden');
+      } else {
+        node.removeClass('hidden');
+      }
+    });
+
+    // Second pass: Terminals and equipment follow their parent bus
+    cy.nodes('[kind="terminal"], [kind="equipment"]').forEach((node) => {
+      const parentBusId = node.data('parentBusId') || node.data('busId');
+      if (parentBusId) {
+        const parentBus = cy.getElementById(parentBusId);
+        if (parentBus.length > 0 && parentBus.hasClass('hidden')) {
+          node.addClass('hidden');
+        } else {
+          node.removeClass('hidden');
+        }
+      }
+    });
+
+    // Third pass: Transformers - show if ANY connected bus is visible
+    // When a transformer bridges a visible bus to a bus beyond depth, show BOTH sides
+    cy.nodes('[kind="transformer"], [kind="transformer2"], [kind="transformer3"]').forEach((xfmr) => {
+      // Find connected terminals via edges
+      const connectedTerminals = xfmr.connectedEdges().connectedNodes().filter(
+        (n) => n.data('kind') === 'terminal'
+      );
+
+      // Check if ANY connected bus is visible (not hidden)
+      const anyVisible = connectedTerminals.some((term) => {
+        const parentBusId = term.data('parentBusId');
+        if (!parentBusId) return false;
+        const parentBus = cy.getElementById(parentBusId);
+        return parentBus.length > 0 && !parentBus.hasClass('hidden');
+      });
+
+      if (anyVisible && connectedTerminals.length > 0) {
+        // Show the transformer
+        xfmr.removeClass('hidden');
+
+        // Also unhide all connected buses (both sides of transformer)
+        // This is the special transformer exception: if one side is within depth,
+        // we show the other side too (even if it's beyond depth)
+        connectedTerminals.forEach((term) => {
+          const parentBusId = term.data('parentBusId');
+          if (parentBusId) {
+            const parentBus = cy.getElementById(parentBusId);
+            if (parentBus.length > 0) {
+              parentBus.removeClass('hidden');
+              // Also unhide the terminal itself
+              term.removeClass('hidden');
+            }
+          }
+        });
+      } else {
+        xfmr.addClass('hidden');
+      }
+    });
+
+    // Fourth pass: Hide edges if either endpoint is hidden
+    cy.edges().forEach((edge) => {
+      const source = cy.getElementById(edge.data('source'));
+      const target = cy.getElementById(edge.data('target'));
+      if ((source.length > 0 && source.hasClass('hidden')) ||
+          (target.length > 0 && target.hasClass('hidden'))) {
+        edge.addClass('hidden');
+      } else {
+        edge.removeClass('hidden');
+      }
+    });
+  }, [displayDepth, dataVersion]);
+
+  // Apply diagnostics when state changes
+  useEffect(() => {
+    if (cyRef.current) {
+      applyDiagnostics(cyRef.current, diagnostics);
+    }
+  }, [diagnostics]);
+
+  const renderPayload = useCallback(async (payload: CytoscapePayload, centerOnBusNumber?: number) => {
+    const cy = cyRef.current;
+    if (!cy) return;
+
+    // Clear existing elements
+    cy.elements().remove();
+
+    // Convert payload to Cytoscape format
+    const elements: ElementDefinition[] = [
+      ...payload.elements.nodes.map((n) => ({ data: n.data, group: 'nodes' as const })),
+      ...payload.elements.edges.map((e) => ({ data: e.data, group: 'edges' as const })),
+    ];
+
+    cy.add(elements);
+
+    // Run SLD layout
+    try {
+      const result = await runSldLayout(cy, layoutDirection);
+      setLayoutResult(result);
+    } catch (err) {
+      console.error('Layout failed:', err);
+      // Fallback to simple layout
+      cy.layout({
+        name: 'breadthfirst',
+        directed: false,
+        spacingFactor: 1.5,
+        animate: false,
+      }).run();
+    }
+
+    // Apply diagnostics if enabled
+    applyDiagnostics(cy, diagnostics);
+
+    // Equipment IS now grabbable so users can reposition it
+    // Terminals ARE grabbable so users can reorder them along their bus
+    // Transformers ARE grabbable so users can adjust their position between buses
+    // All node types can be dragged by the user
+
+    // Center on the specified bus if provided, otherwise fit to all
+    if (centerOnBusNumber !== undefined) {
+      // Find the center bus node
+      const centerBusNode = cy.nodes('[kind="bus"]').filter((node) => {
+        return node.data('psse_number') === centerOnBusNumber;
+      });
+
+      if (centerBusNode.length > 0) {
+        // Center on the bus and zoom to a reasonable level
+        cy.center(centerBusNode);
+        cy.zoom({ level: 1.5, position: centerBusNode.position() });
+      } else {
+        // Fallback: fit to all visible elements
+        cy.fit(undefined, 50);
+      }
+    } else {
+      // Fit to viewport
+      cy.fit(undefined, 50);
+    }
+
+    // Increment data version to trigger depth filtering
+    setDataVersion((v) => v + 1);
+  }, [layoutDirection, diagnostics]);
+
+  /**
+   * Expand from a specific bus - adds new elements to existing view instead of replacing.
+   * This allows incremental exploration of the network.
+   */
+  const expandFromBus = useCallback(async (
+    expansionBusPsseNumber: number,
+    depth: number
+  ) => {
+    const cy = cyRef.current;
+    if (!cy || !fileId) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      // Step 1: Save positions of all existing nodes
+      const existingPositions = new Map<string, { x: number; y: number }>();
+      const existingNodeIds = new Set<string>();
+      const existingEdgeIds = new Set<string>();
+
+      cy.nodes().forEach((node) => {
+        existingNodeIds.add(node.id());
+        existingPositions.set(node.id(), { ...node.position() });
+      });
+      cy.edges().forEach((edge) => {
+        existingEdgeIds.add(edge.id());
+      });
+
+      // Find the expansion bus position (new nodes will be placed near it)
+      const expansionBus = cy.nodes('[kind="bus"]').filter((node) =>
+        node.data('psse_number') === expansionBusPsseNumber
+      );
+      const expansionPos = expansionBus.length > 0
+        ? expansionBus.position()
+        : { x: 0, y: 0 };
+
+      // Step 2: Fetch new data centered on the expansion bus
+      const spec: ViewSpec = defaultViewSpec({
+        mode: 'bus',
+        center_bus_numbers: [expansionBusPsseNumber],
+        max_depth: depth,
+      });
+
+      console.log('[Expand] Fetching view for bus', expansionBusPsseNumber, 'with depth', depth);
+      console.log('[Expand] ViewSpec:', spec);
+
+      const payload = await generateView(fileId, spec);
+      console.log('[Expand] Received payload with', payload.elements.nodes.length, 'nodes and', payload.elements.edges.length, 'edges');
+
+      // Step 3: Filter to only new elements
+      const newNodes: ElementDefinition[] = [];
+      const newEdges: ElementDefinition[] = [];
+
+      for (const node of payload.elements.nodes) {
+        if (!existingNodeIds.has(node.data.id)) {
+          newNodes.push({ data: node.data, group: 'nodes' as const });
+        }
+      }
+
+      for (const edge of payload.elements.edges) {
+        if (!existingEdgeIds.has(edge.data.id)) {
+          // Only add edge if both endpoints exist (either already in graph or being added)
+          const sourceExists = existingNodeIds.has(edge.data.source) ||
+            newNodes.some(n => n.data?.id === edge.data.source);
+          const targetExists = existingNodeIds.has(edge.data.target) ||
+            newNodes.some(n => n.data?.id === edge.data.target);
+
+          if (sourceExists && targetExists) {
+            newEdges.push({ data: edge.data, group: 'edges' as const });
+          }
+        }
+      }
+
+      console.log(`[Expand] Adding ${newNodes.length} new nodes and ${newEdges.length} new edges from bus ${expansionBusPsseNumber}`);
+
+      if (newNodes.length === 0 && newEdges.length === 0) {
+        console.log('[Expand] No new elements to add - all elements already in view');
+        // Show user-friendly message
+        setError(`No new elements found within depth ${depth} from bus ${expansionBusPsseNumber}. Try increasing the depth or the elements may already be in the view.`);
+        // Clear error after 3 seconds
+        setTimeout(() => setError(null), 3000);
+        setLoading(false);
+        return;
+      }
+
+      // Step 4: Add new elements to the graph
+      // Position new nodes initially near the expansion bus (spread out)
+      const newBuses = newNodes.filter(n => n.data?.kind === 'bus');
+      const spreadRadius = 150;
+
+      newBuses.forEach((node, idx) => {
+        const angle = (idx / newBuses.length) * 2 * Math.PI;
+        const x = expansionPos.x + spreadRadius * Math.cos(angle);
+        const y = expansionPos.y + spreadRadius * Math.sin(angle);
+        (node as ElementDefinition & { position?: { x: number; y: number } }).position = { x, y };
+      });
+
+      cy.add([...newNodes, ...newEdges]);
+
+      // Show success feedback
+      console.log(`[Expand] Successfully added ${newNodes.length} nodes and ${newEdges.length} edges`);
+
+      // Step 5: Lock existing nodes and run layout only on new nodes
+      // First, lock all existing buses
+      existingNodeIds.forEach((nodeId) => {
+        const node = cy.getElementById(nodeId);
+        if (node.length > 0) {
+          node.lock();
+        }
+      });
+
+      // Run layout (will only move unlocked nodes)
+      try {
+        const result = await runSldLayout(cy, layoutDirection);
+        setLayoutResult(result);
+      } catch (err) {
+        console.error('Layout failed during expansion:', err);
+      }
+
+      // Unlock all nodes
+      cy.nodes().unlock();
+
+      // Restore original positions for existing nodes (in case layout moved them)
+      existingPositions.forEach((pos, nodeId) => {
+        const node = cy.getElementById(nodeId);
+        if (node.length > 0) {
+          node.position(pos);
+        }
+      });
+
+      // Position terminals and equipment for new buses
+      // (they should have been positioned by layout, but let's ensure they're correct)
+
+      // Apply diagnostics if enabled
+      applyDiagnostics(cy, diagnostics);
+
+      // Center on the expansion bus
+      if (expansionBus.length > 0) {
+        cy.center(expansionBus);
+        cy.zoom({ level: 1.5, position: expansionBus.position() });
+      }
+
+      // Trigger depth filtering update
+      setDataVersion((v) => v + 1);
+
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError(`${err.code}: ${err.message}`);
+      } else {
+        setError('Failed to expand view');
+      }
+      console.error('Expansion failed:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, [fileId, layoutDirection, diagnostics]);
+
+  const handleFit = useCallback(() => {
+    cyRef.current?.fit(undefined, 50);
+  }, []);
+
+  const handleZoomIn = useCallback(() => {
+    const cy = cyRef.current;
+    if (cy) cy.zoom(cy.zoom() * 1.5);
+  }, []);
+
+  const handleZoomOut = useCallback(() => {
+    const cy = cyRef.current;
+    if (cy) cy.zoom(cy.zoom() / 1.5);
+  }, []);
+
+  const handleResetZoom = useCallback(() => {
+    const cy = cyRef.current;
+    if (cy) {
+      cy.zoom(1);
+      cy.center();
+    }
+  }, []);
+
+  const handleRelayout = useCallback(async () => {
+    const cy = cyRef.current;
+    if (!cy) return;
+
+    setLoading(true);
+    try {
+      const result = await runSldLayout(cy, layoutDirection);
+      setLayoutResult(result);
+      applyDiagnostics(cy, diagnostics);
+      cy.fit(undefined, 50);
+    } catch (err) {
+      console.error('Re-layout failed:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, [layoutDirection, diagnostics]);
+
+  const handleToggleDiagnostics = useCallback(() => {
+    setDiagnostics((prev) => ({ ...prev, enabled: !prev.enabled }));
+  }, []);
+
+  // Handle bus resize from slider
+  const handleBusResize = useCallback((newLength: number) => {
+    const cy = cyRef.current;
+    if (!cy || !selectedBus) return;
+
+    const busNode = cy.getElementById(selectedBus.id);
+    if (busNode.length === 0) return;
+
+    // Update the bus bar size
+    const orientation = selectedBus.orientation;
+    if (orientation === 'horizontal') {
+      busNode.style('width', newLength);
+    } else {
+      busNode.style('height', newLength);
+    }
+
+    // Store user-specified length in node data
+    busNode.data('userBusbarLength', newLength);
+
+    // Update selected bus state
+    setSelectedBus(prev => prev ? { ...prev, currentLength: newLength } : null);
+
+    // Reposition terminals to fit the new bus bar length
+    const busId = selectedBus.id;
+    const busPos = busNode.position();
+    const terminals = cy.nodes(`[parentBusId="${busId}"][kind="terminal"]`);
+
+    // Group terminals by side
+    const leftTerminals: NodeSingular[] = [];
+    const rightTerminals: NodeSingular[] = [];
+
+    terminals.forEach((term) => {
+      const termX = term.position('x');
+      if (termX < busPos.x) {
+        leftTerminals.push(term);
+      } else {
+        rightTerminals.push(term);
+      }
+    });
+
+    // Reposition terminals along the resized bus
+    const repositionTerminals = (terms: NodeSingular[], xOffset: number) => {
+      if (terms.length === 0) return;
+
+      // Sort by current Y position to maintain order
+      terms.sort((a, b) => a.position('y') - b.position('y'));
+
+      const spacing = newLength / (terms.length + 1);
+      terms.forEach((term, idx) => {
+        const y = busPos.y - newLength / 2 + spacing * (idx + 1);
+        term.position({ x: busPos.x + xOffset, y });
+      });
+    };
+
+    const busThickness = 8; // from config
+    repositionTerminals(leftTerminals, -busThickness / 2 - 2);
+    repositionTerminals(rightTerminals, busThickness / 2 + 2);
+  }, [selectedBus]);
+
+  // Keyboard shortcuts
+  useKeyboardShortcuts(cyRef.current, {
+    onZoomIn: handleZoomIn,
+    onZoomOut: handleZoomOut,
+    onFit: handleFit,
+    onResetZoom: handleResetZoom,
+    onRelayout: handleRelayout,
+    onToggleDiagnostics: handleToggleDiagnostics,
+  });
+
+  // Box selection handlers for area zoom (Shift) and multi-select (Ctrl)
+  const handleBoxMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    // Shift = zoom mode, Ctrl = select mode
+    if (!e.shiftKey && !e.ctrlKey && !e.metaKey) return;
+
+    const container = containerRef.current;
+    if (!container) return;
+
+    const rect = container.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    setBoxSelectActive(true);
+    setBoxSelectMode(e.shiftKey ? 'zoom' : 'select');
+    setBoxStart({ x, y });
+    setBoxEnd({ x, y });
+    e.preventDefault();
+  }, []);
+
+  const handleBoxMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (!boxSelectActive || !boxStart) return;
+
+    const container = containerRef.current;
+    if (!container) return;
+
+    const rect = container.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    setBoxEnd({ x, y });
+  }, [boxSelectActive, boxStart]);
+
+  const handleBoxMouseUp = useCallback(() => {
+    if (!boxSelectActive || !boxStart || !boxEnd || !cyRef.current) {
+      setBoxSelectActive(false);
+      setBoxStart(null);
+      setBoxEnd(null);
+      return;
+    }
+
+    const cy = cyRef.current;
+
+    // Calculate the selection box in rendered coordinates
+    const minX = Math.min(boxStart.x, boxEnd.x);
+    const maxX = Math.max(boxStart.x, boxEnd.x);
+    const minY = Math.min(boxStart.y, boxEnd.y);
+    const maxY = Math.max(boxStart.y, boxEnd.y);
+
+    // Only process if box is at least 20px in both dimensions
+    if (maxX - minX > 20 && maxY - minY > 20) {
+      // Convert rendered coordinates to model coordinates
+      const pan = cy.pan();
+      const zoom = cy.zoom();
+
+      const modelMinX = (minX - pan.x) / zoom;
+      const modelMaxX = (maxX - pan.x) / zoom;
+      const modelMinY = (minY - pan.y) / zoom;
+      const modelMaxY = (maxY - pan.y) / zoom;
+
+      if (boxSelectMode === 'zoom') {
+        // Zoom to the selected area
+        const boxWidth = modelMaxX - modelMinX;
+        const boxHeight = modelMaxY - modelMinY;
+        const containerWidth = cy.width();
+        const containerHeight = cy.height();
+
+        const newZoom = Math.min(
+          containerWidth / boxWidth,
+          containerHeight / boxHeight,
+          cy.maxZoom()
+        ) * 0.9; // 90% to add some padding
+
+        const centerX = (modelMinX + modelMaxX) / 2;
+        const centerY = (modelMinY + modelMaxY) / 2;
+
+        cy.zoom({
+          level: newZoom,
+          position: { x: centerX, y: centerY },
+        });
+      } else {
+        // Multi-select mode: select all buses in the box
+        cy.$(':selected').unselect(); // Clear previous selection
+
+        cy.nodes('[kind="bus"]').forEach((node) => {
+          const pos = node.position();
+          if (pos.x >= modelMinX && pos.x <= modelMaxX &&
+              pos.y >= modelMinY && pos.y <= modelMaxY) {
+            node.select();
+          }
+        });
+
+        // Also select transformers in the box
+        cy.nodes('[kind="transformer"], [kind="transformer2"], [kind="transformer3"]').forEach((node) => {
+          const pos = node.position();
+          if (pos.x >= modelMinX && pos.x <= modelMaxX &&
+              pos.y >= modelMinY && pos.y <= modelMaxY) {
+            node.select();
+          }
+        });
+
+        const selectedCount = cy.$(':selected').length;
+        setMultiSelectActive(selectedCount > 1);
+        setSelectedBus(null); // Disable bus resize panel in multi-select mode
+      }
+    }
+
+    setBoxSelectActive(false);
+    setBoxStart(null);
+    setBoxEnd(null);
+  }, [boxSelectActive, boxStart, boxEnd, boxSelectMode]);
+
+  // Calculate box selection rect style (different colors for zoom vs select mode)
+  const getBoxStyle = (): React.CSSProperties | null => {
+    if (!boxStart || !boxEnd) return null;
+
+    const minX = Math.min(boxStart.x, boxEnd.x);
+    const minY = Math.min(boxStart.y, boxEnd.y);
+    const width = Math.abs(boxEnd.x - boxStart.x);
+    const height = Math.abs(boxEnd.y - boxStart.y);
+
+    const isSelect = boxSelectMode === 'select';
+    return {
+      position: 'absolute',
+      left: minX,
+      top: minY,
+      width,
+      height,
+      border: `2px dashed ${isSelect ? '#28a745' : '#007bff'}`,
+      backgroundColor: isSelect ? 'rgba(40, 167, 69, 0.1)' : 'rgba(0, 123, 255, 0.1)',
+      pointerEvents: 'none',
+      zIndex: 1000,
+    };
   };
 
-  // Loading state
-  if (loading) {
-    return (
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "center",
-          alignItems: "center",
-          height: "100%",
-          minHeight: "400px",
-          background: "#1a1a2e",
-          color: "#eee",
-        }}
-      >
-        <div>Loading graph view...</div>
-      </div>
-    );
-  }
+  // Get diagnostics info when enabled
+  const diagInfo = diagnostics.enabled && cyRef.current
+    ? getDiagnosticsInfo(cyRef.current)
+    : null;
 
-  // Error state
-  if (error) {
-    return (
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          justifyContent: "center",
-          alignItems: "center",
-          height: "100%",
-          minHeight: "400px",
-          padding: "20px",
-          background: "#1a1a2e",
-        }}
-      >
-        <div style={{ color: "#e74c3c", marginBottom: "10px" }}>
-          Error loading graph view
-        </div>
-        <div style={{ color: "#888", fontSize: "14px" }}>{error}</div>
-      </div>
-    );
-  }
-
-  // Render graph container with detail panel
   return (
-    <div style={{ width: "100%", height: "100%", position: "relative", display: "flex", background: "#f8f9fa" }}>
-      {/* Main graph area */}
-      <div style={{ flex: 1, position: "relative" }}>
-        {/* Controls overlay */}
-        <div
-          style={{
-            position: "absolute",
-            top: "10px",
-            right: "10px",
-            background: "rgba(255, 255, 255, 0.95)",
-            padding: "10px 14px",
-            borderRadius: "6px",
-            fontSize: "12px",
-            zIndex: 1000,
-            boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
-            display: "flex",
-            gap: "12px",
-            alignItems: "center",
-          }}
-        >
-          <div>
-            <label>Mode: </label>
-            <select
-              value={viewMode}
-              onChange={(e) => setViewMode(e.target.value as ViewMode)}
-              style={{ padding: "4px" }}
-            >
-              <option value="bus">Bus</option>
-              <option value="substation">Substation</option>
-              <option value="station_detail">Station Detail</option>
-            </select>
-          </div>
-          <div>
-            <label>Center: </label>
-            <input
-              type="number"
-              value={centerBus ?? ""}
-              placeholder="(auto)"
-              onChange={(e) => {
-                const v = e.target.value;
-                setCenterBus(v === "" ? null : Number(v));
-              }}
-              style={{ width: "90px", padding: "4px" }}
-              disabled={viewMode === "substation"}
-              title={viewMode === "substation" ? "Center bus not used in substation mode" : ""}
-            />
-          </div>
-          <div>
-            <label>Degrees: </label>
-            <input
-              type="number"
-              min={0}
-              max={10}
-              value={degrees}
-              onChange={(e) => setDegrees(Number(e.target.value))}
-              style={{ width: "50px", padding: "4px" }}
-            />
-          </div>
-          <label style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-            <input
-              type="checkbox"
-              checked={showEquipment}
-              onChange={(e) => setShowEquipment(e.target.checked)}
-            />
-            Equipment
-          </label>
-          <label style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-            <input
-              type="checkbox"
-              checked={showSubstationGroups}
-              onChange={(e) => setShowSubstationGroups(e.target.checked)}
-            />
-            Substations
-          </label>
-          <button
-            onClick={() => setCenterBus(null)}
-            style={{
-              padding: "4px 10px",
-              fontSize: "12px",
-              cursor: "pointer",
-              background: "#3498db",
-              color: "#fff",
-              border: "none",
-              borderRadius: "4px",
-            }}
+    <div style={styles.container}>
+      <div style={styles.controls}>
+        <div style={styles.depthControl}>
+          <label htmlFor="depth-slider">Depth: {displayDepth}</label>
+          <input
+            id="depth-slider"
+            type="range"
+            min={0}
+            max={15}
+            value={displayDepth}
+            onChange={(e) => setDisplayDepth(parseInt(e.target.value, 10))}
+            style={styles.slider}
+          />
+        </div>
+
+        <div style={styles.directionControl}>
+          <label htmlFor="direction-select">Direction:</label>
+          <select
+            id="direction-select"
+            value={layoutDirection}
+            onChange={(e) => setLayoutDirection(e.target.value as LayoutDirection)}
+            style={styles.select}
           >
-            Reset
+            <option value="AUTO">Auto</option>
+            <option value="RIGHT">Right</option>
+            <option value="DOWN">Down</option>
+          </select>
+        </div>
+
+        {/* 17.18: Edit Mode Toggle */}
+        <div style={styles.editModeControl}>
+          <label style={{
+            ...styles.checkboxLabel,
+            backgroundColor: editMode ? '#e8f5e9' : '#ffebee',
+            padding: '4px 8px',
+            borderRadius: '4px',
+            border: editMode ? '1px solid #4caf50' : '1px solid #f44336',
+          }}>
+            <input
+              type="checkbox"
+              checked={editMode}
+              onChange={(e) => setEditMode(e.target.checked)}
+            />
+            {editMode ? '✏️ Edit Mode' : '🔒 Locked'}
+          </label>
+        </div>
+
+        <div style={styles.lockControl}>
+          <label style={styles.checkboxLabel}>
+            <input
+              type="checkbox"
+              checked={lockEquipmentToBus}
+              onChange={(e) => setLockEquipmentToBus(e.target.checked)}
+            />
+            Lock equipment
+          </label>
+        </div>
+
+        <div style={styles.gridControl}>
+          <label style={styles.checkboxLabel}>
+            <input
+              type="checkbox"
+              checked={showGrid}
+              onChange={(e) => setShowGrid(e.target.checked)}
+            />
+            Grid
+          </label>
+          <label style={{ ...styles.checkboxLabel, marginLeft: '8px' }}>
+            <input
+              type="checkbox"
+              checked={snapToGrid}
+              onChange={(e) => setSnapToGrid(e.target.checked)}
+            />
+            Snap
+          </label>
+        </div>
+
+        <div style={styles.zoomControls}>
+          <button onClick={handleZoomIn} style={styles.button} title="Zoom in (+)">+</button>
+          <button onClick={handleZoomOut} style={styles.button} title="Zoom out (-)">-</button>
+          <button onClick={handleFit} style={styles.button} title="Fit to view (F)">Fit</button>
+          <button onClick={handleRelayout} style={styles.button} title="Re-layout (R)">Layout</button>
+          <button
+            onClick={handleToggleDiagnostics}
+            style={{
+              ...styles.button,
+              backgroundColor: diagnostics.enabled ? '#e7f3ff' : '#f0f0f0',
+            }}
+            title="Toggle diagnostics (D)"
+          >
+            Diag
           </button>
           <button
-            onClick={() => {
-              cachedPositionsRef.current = {};
-              // Force re-render to trigger layout recalculation
-              setElements((prev) => prev ? { ...prev } : prev);
-            }}
-            style={{
-              padding: "4px 10px",
-              fontSize: "12px",
-              cursor: "pointer",
-              background: "#e74c3c",
-              color: "#fff",
-              border: "none",
-              borderRadius: "4px",
-            }}
-            title="Force layout recalculation"
+            onClick={() => setShowShortcuts(!showShortcuts)}
+            style={styles.button}
+            title="Show keyboard shortcuts"
           >
-            Re-layout
+            ?
           </button>
         </div>
 
-        {/* Stats overlay */}
         {meta && (
-          <div
-            style={{
-              position: "absolute",
-              top: "10px",
-              left: "10px",
-              background: "rgba(255, 255, 255, 0.95)",
-              padding: "8px 12px",
-              borderRadius: "6px",
-              fontSize: "11px",
-              zIndex: 1000,
-              boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
-            }}
-          >
-            <div>Buses: {meta.node_count}</div>
-            <div>Branches: {meta.edge_count}</div>
-            {meta.equipment_count !== undefined && <div>Equipment: {meta.equipment_count}</div>}
-            {meta.truncated && <div style={{ color: "#e74c3c" }}>Truncated</div>}
-          </div>
+          <span style={styles.meta}>
+            Nodes: {meta.node_count as number} | Edges: {meta.edge_count as number}
+            {layoutResult && !layoutResult.fallback && (
+              <> | Dir: {layoutResult.direction}</>
+            )}
+            {layoutResult?.fallback && (
+              <span style={{ color: '#dc3545' }}> | Fallback layout</span>
+            )}
+          </span>
         )}
-
-        {/* Legend */}
-        <div
-          style={{
-            position: "absolute",
-            bottom: "10px",
-            left: "10px",
-            background: "rgba(255, 255, 255, 0.95)",
-            padding: "8px 12px",
-            borderRadius: "6px",
-            fontSize: "10px",
-            zIndex: 1000,
-            boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
-          }}
-        >
-          <div style={{ fontWeight: "bold", marginBottom: "4px" }}>Voltage (kV)</div>
-          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-            <span><span style={{ display: "inline-block", width: 10, height: 10, background: "#e74c3c", marginRight: 3 }}></span>500+</span>
-            <span><span style={{ display: "inline-block", width: 10, height: 10, background: "#9b59b6", marginRight: 3 }}></span>345</span>
-            <span><span style={{ display: "inline-block", width: 10, height: 10, background: "#3498db", marginRight: 3 }}></span>230</span>
-            <span><span style={{ display: "inline-block", width: 10, height: 10, background: "#27ae60", marginRight: 3 }}></span>115</span>
-            <span><span style={{ display: "inline-block", width: 10, height: 10, background: "#f39c12", marginRight: 3 }}></span>69</span>
-            <span><span style={{ display: "inline-block", width: 10, height: 10, background: "#95a5a6", marginRight: 3 }}></span>LV</span>
-          </div>
-        </div>
-
-        {/* Cytoscape container */}
-        <div
-          ref={containerRef}
-          style={{
-            width: "100%",
-            height: "100%",
-            minHeight: "400px",
-          }}
-        />
       </div>
 
-      {/* Detail Panel */}
-      {selectedElement && (
-        <div
-          style={{
-            width: "320px",
-            background: "#fff",
-            borderLeft: "1px solid #ddd",
-            padding: "16px",
-            overflowY: "auto",
-            fontSize: "13px",
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-            <h3 style={{ margin: 0, fontSize: "14px" }}>
-              {selectedElement.kind === "bus" && "Bus Data"}
-              {selectedElement.kind === "branch" && "Branch Data"}
-              {selectedElement.kind === "equipment" && "Equipment Data"}
-              {selectedElement.kind === "transformer" && "Transformer Data"}
-              {(selectedElement.kind === "substation" || selectedElement.kind === "neighbor_substation_stub" || selectedElement.kind === "substation_group") && "Substation Data"}
-            </h3>
-            <button
-              onClick={() => setSelectedElement(null)}
-              style={{ background: "none", border: "none", cursor: "pointer", fontSize: "18px" }}
-            >
-              ×
-            </button>
+      {/* Diagnostics panel */}
+      {diagnostics.enabled && diagInfo && (
+        <div style={styles.diagPanel}>
+          <strong>Diagnostics</strong>
+          <div>Buses: {diagInfo.busCount}</div>
+          <div>Terminals: {diagInfo.terminalCount}</div>
+          <div>Equipment: {diagInfo.equipmentCount}</div>
+          <div>Transformers: {diagInfo.transformerCount}</div>
+          <div style={diagInfo.collisionStats.equipmentCollisions > 0 ? { color: '#dc3545' } : {}}>
+            Equipment collisions: {diagInfo.collisionStats.equipmentCollisions}
           </div>
-
-          {selectedElement.kind === "bus" && (
-            <BusDetailPanel data={selectedElement as BusNodeData} onExpand={handleExpandFromBus} />
-          )}
-          {selectedElement.kind === "branch" && (
-            <BranchDetailPanel data={selectedElement as BranchEdgeData} />
-          )}
-          {selectedElement.kind === "equipment" && (
-            <EquipmentDetailPanel data={selectedElement as EquipmentNodeData} />
-          )}
-          {selectedElement.kind === "transformer" && (
-            <TransformerDetailPanel data={selectedElement as TransformerNodeData} />
-          )}
-          {(selectedElement.kind === "substation" || selectedElement.kind === "neighbor_substation_stub" || selectedElement.kind === "substation_group") && (
-            <SubstationDetailPanel data={selectedElement as SubstationNodeData} />
+          <div style={diagInfo.collisionStats.busCollisions > 0 ? { color: '#dc3545' } : {}}>
+            Bus collisions: {diagInfo.collisionStats.busCollisions}
+          </div>
+          {diagInfo.nodesAtOrigin > 0 && (
+            <div style={{ color: '#fd7e14' }}>
+              Nodes at origin: {diagInfo.nodesAtOrigin}
+            </div>
           )}
         </div>
       )}
-    </div>
-  );
-};
 
-// Sub-components for detail panels
-const BusDetailPanel: React.FC<{ data: BusNodeData; onExpand: (psse: number) => void }> = ({ data, onExpand }) => (
-  <div>
-    <table style={{ width: "100%", borderCollapse: "collapse" }}>
-      <tbody>
-        <DetailRow label="Bus Number" value={data.psse_number} />
-        <DetailRow label="Name" value={data.name} />
-        <DetailRow label="Base kV" value={data.base_kv?.toFixed(1)} />
-        <DetailRow label="Area" value={data.area} />
-        <DetailRow label="Zone" value={data.zone} />
-        <DetailRow label="Owner" value={data.owner} />
-        <DetailRow label="Vm (pu)" value={data.vm?.toFixed(4)} />
-        <DetailRow label="Va (deg)" value={data.va?.toFixed(2)} />
-        <DetailRow label="Vmax (pu)" value={data.vmax?.toFixed(4)} />
-        <DetailRow label="Vmin (pu)" value={data.vmin?.toFixed(4)} />
-      </tbody>
-    </table>
-    <button
-      onClick={() => onExpand(data.psse_number)}
-      style={{
-        marginTop: "12px",
-        padding: "8px 16px",
-        background: "#3498db",
-        color: "#fff",
-        border: "none",
-        borderRadius: "4px",
-        cursor: "pointer",
-        width: "100%",
-      }}
-    >
-      Expand from this bus
-    </button>
-  </div>
-);
+      {/* Bus resize panel - shown when a bus is selected */}
+      {selectedBus && (
+        <div style={styles.busResizePanel}>
+          <strong>Bus: {selectedBus.psseNumber}</strong>
+          <div style={{ fontSize: '11px', color: '#666', marginBottom: '8px' }}>{selectedBus.name}</div>
+          <div style={styles.resizeControl}>
+            <label htmlFor="bus-size-slider">Size: {Math.round(selectedBus.currentLength)}px</label>
+            <input
+              id="bus-size-slider"
+              type="range"
+              min={30}
+              max={400}
+              value={selectedBus.currentLength}
+              onChange={(e) => handleBusResize(parseInt(e.target.value, 10))}
+              style={styles.resizeSlider}
+            />
+          </div>
+          <div style={{ fontSize: '10px', color: '#999', marginTop: '4px' }}>
+            Click elsewhere to deselect
+          </div>
+        </div>
+      )}
 
-const BranchDetailPanel: React.FC<{ data: BranchEdgeData }> = ({ data }) => (
-  <div>
-    <div style={{ marginBottom: "8px", padding: "6px", background: "#ecf0f1", borderRadius: "4px" }}>
-      <strong>Type:</strong> {data.type.toUpperCase()}
-    </div>
-    <table style={{ width: "100%", borderCollapse: "collapse" }}>
-      <tbody>
-        <DetailRow label="Circuit ID" value={data.circuit} />
-        <DetailRow label="R (pu)" value={data.r?.toFixed(6)} />
-        <DetailRow label="X (pu)" value={data.x?.toFixed(6)} />
-        <DetailRow label="B (pu)" value={data.b?.toFixed(6)} />
-        <DetailRow label="G (pu)" value={data.g?.toFixed(6)} />
-        <DetailRow label="R0 (pu)" value={data.r0?.toFixed(6)} />
-        <DetailRow label="X0 (pu)" value={data.x0?.toFixed(6)} />
-        <DetailRow label="B0 (pu)" value={data.b0?.toFixed(6)} />
-        <DetailRow label="Rating MVA" value={data.rating_mva?.toFixed(1)} />
-        <DetailRow label="Rate A" value={data.rate_a?.toFixed(1)} />
-        <DetailRow label="Rate B" value={data.rate_b?.toFixed(1)} />
-        <DetailRow label="Rate C" value={data.rate_c?.toFixed(1)} />
-        {data.type.startsWith("xfmr") && (
-          <>
-            <DetailRow label="Tap Module" value={data.tap_module?.toFixed(4)} />
-            <DetailRow label="Tap Phase" value={data.tap_phase?.toFixed(2)} />
-          </>
-        )}
-        {data.type === "line" && <DetailRow label="Length" value={data.length?.toFixed(2)} />}
-        <DetailRow label="P From (MW)" value={data.p_from_mw?.toFixed(2)} />
-        <DetailRow label="Q From (Mvar)" value={data.q_from_mvar?.toFixed(2)} />
-        <DetailRow label="P To (MW)" value={data.p_to_mw?.toFixed(2)} />
-        <DetailRow label="Q To (Mvar)" value={data.q_to_mvar?.toFixed(2)} />
-      </tbody>
-    </table>
-  </div>
-);
-
-const EquipmentDetailPanel: React.FC<{ data: EquipmentNodeData }> = ({ data }) => {
-  const style = EQUIPMENT_STYLES[data.equipment_type] || EQUIPMENT_STYLES.other;
-  return (
-    <div>
-      <div
-        style={{
-          marginBottom: "8px",
-          padding: "6px",
-          background: style.color,
-          color: "#fff",
-          borderRadius: "4px",
-          textAlign: "center",
-        }}
-      >
-        <strong>{data.equipment_type.toUpperCase()}</strong>
-      </div>
-      <table style={{ width: "100%", borderCollapse: "collapse" }}>
-        <tbody>
-          <DetailRow label="Name" value={data.name || "(unnamed)"} />
-          <DetailRow label="Status" value={data.status ? "In Service" : "Out of Service"} />
-          <DetailRow label="P (MW)" value={data.p_mw?.toFixed(2)} />
-          <DetailRow label="Q (Mvar)" value={data.q_mvar?.toFixed(2)} />
-          {data.metadata && Object.entries(data.metadata).map(([key, val]) => (
-            <DetailRow key={key} label={key} value={val != null ? String(val) : "-"} />
+      {/* Shortcuts panel */}
+      {showShortcuts && (
+        <div style={styles.shortcutsPanel}>
+          <strong>Keyboard Shortcuts</strong>
+          {getShortcutsList().map(({ key, description }) => (
+            <div key={key}>
+              <span style={styles.shortcutKey}>{key}</span> {description}
+            </div>
           ))}
-        </tbody>
-      </table>
+        </div>
+      )}
+
+      <div
+        style={styles.graphWrapper}
+        onMouseDown={handleBoxMouseDown}
+        onMouseMove={handleBoxMouseMove}
+        onMouseUp={handleBoxMouseUp}
+        onMouseLeave={handleBoxMouseUp}
+      >
+        {/* Cytoscape container - must have no React children */}
+        <div ref={containerRef} style={styles.graphContainer} />
+        {/* Grid overlay - rendered as SVG pattern */}
+        {showGrid && (
+          <svg
+            style={styles.gridOverlay}
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <defs>
+              <pattern
+                id="grid-pattern"
+                width={gridSize}
+                height={gridSize}
+                patternUnits="userSpaceOnUse"
+              >
+                <path
+                  d={`M ${gridSize} 0 L 0 0 0 ${gridSize}`}
+                  fill="none"
+                  stroke="rgba(0,0,0,0.1)"
+                  strokeWidth="0.5"
+                />
+              </pattern>
+              <pattern
+                id="grid-pattern-major"
+                width={gridSize * 5}
+                height={gridSize * 5}
+                patternUnits="userSpaceOnUse"
+              >
+                <rect width={gridSize * 5} height={gridSize * 5} fill="url(#grid-pattern)" />
+                <path
+                  d={`M ${gridSize * 5} 0 L 0 0 0 ${gridSize * 5}`}
+                  fill="none"
+                  stroke="rgba(0,0,0,0.2)"
+                  strokeWidth="1"
+                />
+              </pattern>
+            </defs>
+            <rect width="100%" height="100%" fill="url(#grid-pattern-major)" />
+          </svg>
+        )}
+        {/* Box selection overlay */}
+        {boxSelectActive && boxStart && boxEnd && (
+          <div style={getBoxStyle() || undefined} ref={boxOverlayRef} />
+        )}
+        {/* Overlays rendered separately */}
+        {loading && <div style={styles.overlay}>Loading...</div>}
+        {error && <div style={styles.errorOverlay}>{error}</div>}
+        {!fileId && <div style={styles.placeholder}>Upload a case file to begin</div>}
+        {fileId && centerBusNumber === null && (
+          <div style={styles.placeholder}>Enter a bus number to view the diagram</div>
+        )}
+        {/* Box selection hint */}
+        {fileId && centerBusNumber !== null && !loading && !error && (
+          <div style={styles.boxSelectHint}>
+            Shift+Drag: Zoom | Ctrl+Drag: Select | Ctrl+Click: Toggle | Dbl-click terminal: Flip side
+          </div>
+        )}
+        {/* Multi-select indicator */}
+        {multiSelectActive && cyRef.current && (
+          <div style={styles.multiSelectIndicator}>
+            {cyRef.current.$(':selected').length} items selected - Drag any to move all
+          </div>
+        )}
+        {/* Context menu */}
+        {contextMenu && contextMenu.visible && (
+          <div
+            style={{
+              ...styles.contextMenu,
+              left: contextMenu.x,
+              top: contextMenu.y,
+            }}
+            onClick={() => setContextMenu(null)}
+          >
+            <div style={styles.contextMenuHeader}>
+              Bus {contextMenu.busNumber}
+            </div>
+            <div
+              style={styles.contextMenuItem}
+              onClick={(e) => {
+                e.stopPropagation();
+                // Store the target bus info before closing context menu
+                setExpandTargetBus({
+                  id: contextMenu.busId,
+                  number: contextMenu.busNumber,
+                  name: contextMenu.busName,
+                });
+                setShowExpandDialog(true);
+                setContextMenu(null);
+              }}
+            >
+              Expand from this bus...
+            </div>
+            <div
+              style={styles.contextMenuItem}
+              onClick={(e) => {
+                e.stopPropagation();
+                // Center on this bus
+                const busNode = cyRef.current?.getElementById(contextMenu.busId);
+                if (busNode && busNode.length > 0) {
+                  cyRef.current?.center(busNode);
+                  cyRef.current?.zoom({ level: 2, position: busNode.position() });
+                }
+                setContextMenu(null);
+              }}
+            >
+              Center on bus
+            </div>
+            <div
+              style={styles.contextMenuItem}
+              onClick={(e) => {
+                e.stopPropagation();
+                // Toggle bus shape between circle and busbar
+                const busNode = cyRef.current?.getElementById(contextMenu.busId);
+                if (busNode && busNode.length > 0) {
+                  const currentForce = busNode.data('forceShape') as string | undefined;
+                  const connectionCount = busNode.data('connectionCount') as number || 0;
+
+                  // Cycle through: auto -> opposite of current -> back to auto
+                  if (currentForce === 'circle') {
+                    busNode.data('forceShape', 'busbar');
+                  } else if (currentForce === 'busbar') {
+                    busNode.removeData('forceShape');
+                  } else {
+                    // Auto mode: toggle to opposite of what would be shown
+                    const isCircle = connectionCount <= 2;
+                    busNode.data('forceShape', isCircle ? 'busbar' : 'circle');
+                  }
+                }
+                setContextMenu(null);
+              }}
+            >
+              {(() => {
+                const busNode = cyRef.current?.getElementById(contextMenu.busId);
+                if (!busNode || busNode.length === 0) return 'Toggle bus shape';
+                const forceShape = busNode.data('forceShape') as string | undefined;
+                const connectionCount = busNode.data('connectionCount') as number || 0;
+                const isCurrentlyCircle = forceShape === 'circle' || (!forceShape && connectionCount <= 2);
+                return isCurrentlyCircle ? 'Show as busbar' : 'Show as circle';
+              })()}
+            </div>
+          </div>
+        )}
+        {/* Expand depth dialog */}
+        {showExpandDialog && expandTargetBus && (
+          <div style={styles.dialogOverlay} onClick={() => { setShowExpandDialog(false); setExpandTargetBus(null); }}>
+            <div style={styles.dialog} onClick={(e) => e.stopPropagation()}>
+              <div style={styles.dialogHeader}>
+                Expand from Bus {expandTargetBus.number}
+              </div>
+              <div style={styles.dialogBody}>
+                <label htmlFor="expand-depth">Expansion depth:</label>
+                <input
+                  id="expand-depth"
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={expandDepthInput}
+                  onChange={(e) => setExpandDepthInput(parseInt(e.target.value, 10) || 1)}
+                  style={styles.dialogInput}
+                />
+                <div style={{ fontSize: '12px', color: '#666', marginTop: '8px' }}>
+                  Number of hops from this bus to add to the view
+                </div>
+              </div>
+              <div style={styles.dialogActions}>
+                <button
+                  style={styles.dialogButton}
+                  onClick={() => { setShowExpandDialog(false); setExpandTargetBus(null); }}
+                >
+                  Cancel
+                </button>
+                <button
+                  style={{ ...styles.dialogButton, ...styles.dialogButtonPrimary }}
+                  onClick={() => {
+                    // Call incremental expansion - adds new elements to existing view
+                    expandFromBus(expandTargetBus.number, expandDepthInput);
+                    setShowExpandDialog(false);
+                    setExpandTargetBus(null);
+                  }}
+                >
+                  Expand
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
+}
+
+const styles: Record<string, React.CSSProperties> = {
+  container: {
+    display: 'flex',
+    flexDirection: 'column',
+    width: '100%',
+    height: '100%',
+    position: 'relative',
+  },
+  controls: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '20px',
+    padding: '10px 20px',
+    borderBottom: '1px solid #ddd',
+    backgroundColor: '#fff',
+    flexWrap: 'wrap',
+  },
+  depthControl: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+    fontSize: '14px',
+  },
+  directionControl: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    fontSize: '14px',
+  },
+  slider: {
+    width: '120px',
+  },
+  select: {
+    padding: '4px 8px',
+    borderRadius: '4px',
+    border: '1px solid #ccc',
+    fontSize: '14px',
+  },
+  lockControl: {
+    display: 'flex',
+    alignItems: 'center',
+    fontSize: '14px',
+  },
+  editModeControl: {
+    display: 'flex',
+    alignItems: 'center',
+    fontSize: '14px',
+  },
+  checkboxLabel: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px',
+    cursor: 'pointer',
+  },
+  zoomControls: {
+    display: 'flex',
+    gap: '5px',
+  },
+  button: {
+    padding: '5px 10px',
+    backgroundColor: '#f0f0f0',
+    border: '1px solid #ccc',
+    borderRadius: '4px',
+    cursor: 'pointer',
+    fontSize: '14px',
+  },
+  meta: {
+    marginLeft: 'auto',
+    fontSize: '12px',
+    color: '#666',
+  },
+  graphWrapper: {
+    flex: 1,
+    position: 'relative',
+    minHeight: '400px',
+  },
+  graphContainer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: '#fafafa',
+  },
+  overlay: {
+    position: 'absolute',
+    top: '50%',
+    left: '50%',
+    transform: 'translate(-50%, -50%)',
+    padding: '20px',
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    borderRadius: '8px',
+    fontSize: '16px',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+  },
+  errorOverlay: {
+    position: 'absolute',
+    top: '50%',
+    left: '50%',
+    transform: 'translate(-50%, -50%)',
+    padding: '20px',
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    borderRadius: '8px',
+    fontSize: '16px',
+    color: '#dc3545',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+  },
+  placeholder: {
+    position: 'absolute',
+    top: '50%',
+    left: '50%',
+    transform: 'translate(-50%, -50%)',
+    color: '#999',
+    fontSize: '16px',
+  },
+  diagPanel: {
+    position: 'absolute',
+    top: '60px',
+    right: '10px',
+    padding: '10px',
+    backgroundColor: 'rgba(255,255,255,0.95)',
+    borderRadius: '4px',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+    fontSize: '12px',
+    zIndex: 100,
+    lineHeight: 1.6,
+  },
+  shortcutsPanel: {
+    position: 'absolute',
+    top: '60px',
+    left: '10px',
+    padding: '10px',
+    backgroundColor: 'rgba(255,255,255,0.95)',
+    borderRadius: '4px',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+    fontSize: '12px',
+    zIndex: 100,
+    lineHeight: 1.6,
+  },
+  shortcutKey: {
+    display: 'inline-block',
+    padding: '2px 6px',
+    backgroundColor: '#eee',
+    borderRadius: '3px',
+    fontFamily: 'monospace',
+    marginRight: '8px',
+    minWidth: '24px',
+    textAlign: 'center',
+  },
+  boxSelectHint: {
+    position: 'absolute',
+    bottom: '10px',
+    right: '10px',
+    padding: '4px 8px',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    color: '#fff',
+    borderRadius: '4px',
+    fontSize: '11px',
+    pointerEvents: 'none',
+    zIndex: 50,
+  },
+  busResizePanel: {
+    position: 'absolute',
+    top: '60px',
+    left: '50%',
+    transform: 'translateX(-50%)',
+    padding: '12px 16px',
+    backgroundColor: 'rgba(255,255,255,0.98)',
+    borderRadius: '8px',
+    boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+    fontSize: '13px',
+    zIndex: 100,
+    minWidth: '200px',
+    border: '1px solid #ddd',
+  },
+  resizeControl: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: '6px',
+  },
+  resizeSlider: {
+    width: '100%',
+    cursor: 'pointer',
+  },
+  multiSelectIndicator: {
+    position: 'absolute',
+    top: '10px',
+    left: '50%',
+    transform: 'translateX(-50%)',
+    padding: '8px 16px',
+    backgroundColor: 'rgba(40, 167, 69, 0.9)',
+    color: '#fff',
+    borderRadius: '4px',
+    fontSize: '13px',
+    fontWeight: 500,
+    pointerEvents: 'none',
+    zIndex: 100,
+    boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+  },
+  gridControl: {
+    display: 'flex',
+    alignItems: 'center',
+    fontSize: '14px',
+  },
+  gridOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    width: '100%',
+    height: '100%',
+    pointerEvents: 'none',
+    zIndex: 1,
+  },
+  contextMenu: {
+    position: 'absolute',
+    backgroundColor: '#fff',
+    border: '1px solid #ddd',
+    borderRadius: '4px',
+    boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+    zIndex: 1000,
+    minWidth: '160px',
+    overflow: 'hidden',
+  },
+  contextMenuHeader: {
+    padding: '8px 12px',
+    backgroundColor: '#f5f5f5',
+    borderBottom: '1px solid #ddd',
+    fontWeight: 600,
+    fontSize: '13px',
+  },
+  contextMenuItem: {
+    padding: '8px 12px',
+    cursor: 'pointer',
+    fontSize: '13px',
+    transition: 'background-color 0.15s',
+  },
+  dialogOverlay: {
+    position: 'fixed',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 2000,
+  },
+  dialog: {
+    backgroundColor: '#fff',
+    borderRadius: '8px',
+    boxShadow: '0 8px 32px rgba(0,0,0,0.25)',
+    minWidth: '300px',
+    overflow: 'hidden',
+  },
+  dialogHeader: {
+    padding: '16px',
+    backgroundColor: '#f5f5f5',
+    borderBottom: '1px solid #ddd',
+    fontWeight: 600,
+    fontSize: '15px',
+  },
+  dialogBody: {
+    padding: '16px',
+  },
+  dialogInput: {
+    width: '80px',
+    padding: '8px 12px',
+    borderRadius: '4px',
+    border: '1px solid #ccc',
+    fontSize: '14px',
+    marginLeft: '8px',
+  },
+  dialogActions: {
+    padding: '12px 16px',
+    borderTop: '1px solid #ddd',
+    display: 'flex',
+    justifyContent: 'flex-end',
+    gap: '8px',
+  },
+  dialogButton: {
+    padding: '8px 16px',
+    borderRadius: '4px',
+    border: '1px solid #ccc',
+    backgroundColor: '#fff',
+    cursor: 'pointer',
+    fontSize: '14px',
+  },
+  dialogButtonPrimary: {
+    backgroundColor: '#007bff',
+    borderColor: '#007bff',
+    color: '#fff',
+  },
 };
-
-const TransformerDetailPanel: React.FC<{ data: TransformerNodeData }> = ({ data }) => (
-  <div>
-    <div
-      style={{
-        marginBottom: "8px",
-        padding: "6px",
-        background: "#8e44ad",
-        color: "#fff",
-        borderRadius: "4px",
-        textAlign: "center",
-      }}
-    >
-      <strong>TRANSFORMER ({data.type.toUpperCase()})</strong>
-    </div>
-    <table style={{ width: "100%", borderCollapse: "collapse" }}>
-      <tbody>
-        <DetailRow label="Circuit ID" value={data.circuit} />
-        <DetailRow label="R (pu)" value={data.r?.toFixed(6)} />
-        <DetailRow label="X (pu)" value={data.x?.toFixed(6)} />
-        <DetailRow label="B (pu)" value={data.b?.toFixed(6)} />
-        <DetailRow label="G (pu)" value={data.g?.toFixed(6)} />
-        <DetailRow label="R0 (pu)" value={data.r0?.toFixed(6)} />
-        <DetailRow label="X0 (pu)" value={data.x0?.toFixed(6)} />
-        <DetailRow label="B0 (pu)" value={data.b0?.toFixed(6)} />
-        <DetailRow label="Rating MVA" value={data.rating_mva?.toFixed(1)} />
-        <DetailRow label="Rate A" value={data.rate_a?.toFixed(1)} />
-        <DetailRow label="Rate B" value={data.rate_b?.toFixed(1)} />
-        <DetailRow label="Rate C" value={data.rate_c?.toFixed(1)} />
-        <DetailRow label="Tap Module" value={data.tap_module?.toFixed(4)} />
-        <DetailRow label="Tap Phase" value={data.tap_phase?.toFixed(2)} />
-      </tbody>
-    </table>
-  </div>
-);
-
-const SubstationDetailPanel: React.FC<{ data: SubstationNodeData }> = ({ data }) => (
-  <div>
-    <div
-      style={{
-        marginBottom: "8px",
-        padding: "6px",
-        background: data.kind === "substation" ? "#2c3e50" : "#7f8c8d",
-        color: "#fff",
-        borderRadius: "4px",
-        textAlign: "center",
-      }}
-    >
-      <strong>{data.kind === "substation" ? "SUBSTATION" : "NEIGHBOR SUBSTATION"}</strong>
-    </div>
-    <table style={{ width: "100%", borderCollapse: "collapse" }}>
-      <tbody>
-        <DetailRow label="Name" value={data.name} />
-        <DetailRow label="Area" value={data.area} />
-        <DetailRow label="Zone" value={data.zone} />
-        <DetailRow label="Nominal kV" value={data.nominal_kv?.toFixed(1)} />
-        <DetailRow label="Voltage Levels" value={data.voltage_levels?.join(", ") || "-"} />
-        <DetailRow label="Latitude" value={data.latitude?.toFixed(6)} />
-        <DetailRow label="Longitude" value={data.longitude?.toFixed(6)} />
-      </tbody>
-    </table>
-  </div>
-);
-
-const DetailRow: React.FC<{ label: string; value: string | number | null | undefined }> = ({ label, value }) => (
-  <tr style={{ borderBottom: "1px solid #eee" }}>
-    <td style={{ padding: "6px 4px", color: "#666" }}>{label}</td>
-    <td style={{ padding: "6px 4px", fontWeight: 500 }}>{value ?? "-"}</td>
-  </tr>
-);
-
-export default GraphViewer;

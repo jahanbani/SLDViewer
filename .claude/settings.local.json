@@ -1,16 +1,23 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m pytest:*)",
-      "Bash(python test_substation_inference.py:*)",
       "Bash(npm run build:*)",
-      "Bash(python:*)",
+      "Bash(npm test:*)",
       "Bash(cat:*)",
-      "Bash(git init:*)",
-      "Bash(git branch:*)",
-      "Bash(git checkout:*)",
+      "Bash(powershell -Command \"\\(Get-Content src/utils/beautyWorker.ts\\) -replace ''validateRoutingConstraints,\\\\r?\\\\n  BusExtent,\\\\r?\\\\n  BusObstacle,\\\\r?\\\\n  '', '''' | Set-Content src/utils/beautyWorker.ts\")",
+      "Bash(node -e:*)",
+      "Bash(powershell -Command \"\n$content = Get-Content tests/beauty_mode.test.ts -Raw\n$content = $content -replace \"\"toBe\\\\\\\\\\(''fast''\\\\\\\\\\)\"\", \"\"toBe\\(''balanced''\\)\"\"\nSet-Content tests/beauty_mode.test.ts $content\n\")",
+      "Bash(powershell -Command:*)",
+      "Bash(npx tsc:*)",
+      "Bash(python -m pytest tests/test_slicer.py -v --tb=short)",
+      "Bash(python -m pytest:*)",
+      "Bash(npm install:*)",
+      "Bash(git remote add:*)",
+      "Bash(git push:*)",
+      "Bash(git filter-branch:*)",
+      "Bash(git stash:*)",
       "Bash(git add:*)",
-      "Bash(cd:*)"
+      "Bash(git reset:*)"
     ]
   }
 }

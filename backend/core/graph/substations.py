@@ -1,401 +1,263 @@
-"""Substation inference and detection for SLD Viewer.
-
-Implements topology-based substation inference for cases where PSSE substations
-are not available or need to be refined. Uses strong-coupling analysis to cluster
-buses into substations.
 """
+Substation detection and naming utilities.
 
-import uuid
+This module wraps VeraGrid's substation detection and provides:
+- Primary: VeraGrid's built-in substation detection
+- Fallback: prefix-based grouping with naming heuristics
+- Naming fallback for unnamed substations
+"""
 from collections import defaultdict
-from statistics import median
-from typing import Optional
 
-import networkx as nx
-
-from backend.core.graph.models import BranchModel, BusModel, SubstationModel
-
-
-# Thresholds for strong coupling detection
-ZERO_IMPEDANCE_THRESHOLD = 1e-6  # |r| + |x| < threshold means zero impedance
-SMALL_IMPEDANCE_THRESHOLD = 1e-3  # Small impedance for short lines
-MAX_SPATIAL_EXTENT_KM = 5.0  # Maximum extent for a single substation (if lat/lon available)
+from backend.core.graph.models import (
+    BusModel,
+    SubstationModel,
+    make_substation_id,
+)
 
 
-def infer_substations(
+def detect_substations_fallback(
     buses: list[BusModel],
-    branches: list[BranchModel],
-    spatial_threshold_km: float = MAX_SPATIAL_EXTENT_KM,
+    namespace: str,
+    prefix_min_length: int = 3,
 ) -> tuple[list[SubstationModel], dict[str, str]]:
-    """Infer substations from buses and branches using topology analysis.
+    """
+    Fallback substation detection using bus name prefixes.
 
-    Uses strong-coupling analysis to cluster buses into substations. Buses are
-    considered strongly coupled if connected by:
-    - Zero-impedance branches (|r|+|x| ≈ 0)
-    - Small impedance branches (short lines)
-    - Transformers (which typically connect voltage levels within a station)
-
-    If buses have lat/lon coordinates, clusters are split if their spatial extent
-    exceeds the threshold (indicating buses from different physical locations).
+    This is used when VeraGrid doesn't provide substation groupings.
 
     Args:
-        buses: List of bus models
-        branches: List of branch models
-        spatial_threshold_km: Maximum spatial extent (km) for a single substation
+        buses: List of BusModel objects
+        namespace: Case namespace for generating IDs
+        prefix_min_length: Minimum prefix length to consider
 
     Returns:
-        Tuple of (substations, bus_to_substation_map) where:
-        - substations: List of inferred SubstationModel instances
-        - bus_to_substation_map: Dict mapping bus_id to substation_id
+        Tuple of (substations list, bus_id -> substation_id mapping)
     """
-    if not buses:
-        return [], {}
+    # Group buses by common name prefix
+    prefix_groups: dict[str, list[BusModel]] = defaultdict(list)
 
-    # Build bus lookup by ID
-    bus_by_id = {bus.id: bus for bus in buses}
+    for bus in buses:
+        # Extract prefix (everything before the last number/space)
+        prefix = _extract_name_prefix(bus.name, prefix_min_length)
+        if prefix:
+            prefix_groups[prefix].append(bus)
+        else:
+            # No prefix found, group by area/zone
+            key = f"area_{bus.area or 0}_zone_{bus.zone or 0}"
+            prefix_groups[key].append(bus)
 
-    # Build strong-coupling graph
-    strong_coupling_graph = _build_strong_coupling_graph(buses, branches, bus_by_id)
+    # Create substations from groups
+    substations: list[SubstationModel] = []
+    bus_to_substation: dict[str, str] = {}
 
-    # Find connected components (initial clusters)
-    initial_clusters = list(nx.connected_components(strong_coupling_graph))
+    for idx, (prefix, group_buses) in enumerate(sorted(prefix_groups.items())):
+        # Generate substation name
+        if prefix.startswith("area_"):
+            # Fallback naming
+            name = f"Station_{prefix}"
+            name_source = "fallback"
+        else:
+            name = prefix.strip()
+            name_source = "prefix"
 
-    # Split clusters by spatial extent if lat/lon is available
-    final_clusters = []
-    for cluster in initial_clusters:
-        sub_clusters = _split_cluster_by_spatial_extent(
-            cluster, bus_by_id, spatial_threshold_km
+        sub_id = make_substation_id(namespace, name, idx)
+
+        # Collect voltage levels
+        voltage_levels = sorted(set(b.base_kv for b in group_buses), reverse=True)
+
+        # Get area/zone from first bus
+        first_bus = group_buses[0]
+
+        substation = SubstationModel(
+            id=sub_id,
+            name=name,
+            area=first_bus.area,
+            zone=first_bus.zone,
+            voltage_levels=voltage_levels,
+            nominal_kv=max(voltage_levels) if voltage_levels else None,
+            metadata={"name_source": name_source, "bus_count": len(group_buses)},
         )
-        final_clusters.extend(sub_clusters)
 
-    # Build substations from clusters
-    substations = []
-    bus_to_substation_map = {}
-
-    for cluster_idx, cluster_bus_ids in enumerate(final_clusters):
-        cluster_buses = [bus_by_id[bus_id] for bus_id in cluster_bus_ids]
-
-        # Create substation model
-        substation = _create_substation_from_cluster(
-            cluster_idx, cluster_buses
-        )
         substations.append(substation)
 
         # Map buses to this substation
-        for bus_id in cluster_bus_ids:
-            bus_to_substation_map[bus_id] = substation.id
+        for bus in group_buses:
+            bus_to_substation[bus.id] = sub_id
 
-    return substations, bus_to_substation_map
+    return substations, bus_to_substation
 
 
-def _build_strong_coupling_graph(
+def _extract_name_prefix(name: str, min_length: int = 3) -> str | None:
+    """
+    Extract a common prefix from a bus name.
+
+    Tries to find a meaningful prefix by removing trailing numbers,
+    bus designators, and voltage levels.
+
+    Args:
+        name: Bus name
+        min_length: Minimum prefix length to return
+
+    Returns:
+        Prefix string or None if no valid prefix found
+    """
+    if not name:
+        return None
+
+    # Remove common suffixes
+    import re
+
+    # Remove trailing numbers and common suffixes
+    cleaned = re.sub(r"[\s_-]*\d+[\s_-]*$", "", name)
+    cleaned = re.sub(r"[\s_-]*(BUS|HV|LV|MV|KV)[\s_-]*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[\s_-]*\d+[\s_-]*KV[\s_-]*$", "", cleaned, flags=re.IGNORECASE)
+
+    cleaned = cleaned.strip()
+
+    if len(cleaned) >= min_length:
+        return cleaned
+
+    return None
+
+
+def generate_substation_name(
     buses: list[BusModel],
-    branches: list[BranchModel],
-    bus_by_id: dict[str, BusModel],
-) -> nx.Graph:
-    """Build an undirected graph where edges represent strong coupling between buses.
-
-    Strong coupling includes:
-    - Zero-impedance branches (switches, ideal buses)
-    - Small impedance branches (short lines within a station)
-    - Transformers (connect voltage levels in a station)
-
-    Args:
-        buses: List of buses
-        branches: List of branches
-        bus_by_id: Bus lookup dictionary
-
-    Returns:
-        NetworkX undirected graph with bus IDs as nodes
+    area: int | None = None,
+    zone: int | None = None,
+    index: int = 0,
+) -> tuple[str, str]:
     """
-    graph = nx.Graph()
+    Generate a substation name from its buses.
 
-    # Add all buses as nodes
-    for bus in buses:
-        graph.add_node(bus.id)
-
-    # Add edges for strongly coupled branches
-    for branch in branches:
-        # Check if both buses exist
-        if branch.from_bus_id not in bus_by_id or branch.to_bus_id not in bus_by_id:
-            continue
-
-        is_strongly_coupled = False
-
-        # Check for zero impedance
-        impedance_magnitude = abs(branch.r) + abs(branch.x)
-        if impedance_magnitude < ZERO_IMPEDANCE_THRESHOLD:
-            is_strongly_coupled = True
-
-        # Check for small impedance (short lines)
-        elif impedance_magnitude < SMALL_IMPEDANCE_THRESHOLD:
-            is_strongly_coupled = True
-
-        # Check for transformers (typically connect buses in same substation)
-        elif branch.type in ["xfmr", "xfmr3"]:
-            # Transformers usually connect different voltage levels in same station
-            # But only if impedance is reasonably small (not transmission-level transformers)
-            if impedance_magnitude < 0.1:  # Typical station transformer impedance
-                is_strongly_coupled = True
-
-        if is_strongly_coupled:
-            graph.add_edge(branch.from_bus_id, branch.to_bus_id)
-
-    return graph
-
-
-def _split_cluster_by_spatial_extent(
-    cluster_bus_ids: set[str],
-    bus_by_id: dict[str, BusModel],
-    threshold_km: float,
-) -> list[set[str]]:
-    """Split a cluster into sub-clusters if spatial extent exceeds threshold.
-
-    If buses have lat/lon coordinates and the cluster spans more than threshold_km,
-    split it into smaller clusters based on spatial proximity.
+    Strategy:
+    1. Find common prefix of bus names (length >= 3)
+    2. Fall back to "Station_{area}_{zone}_{index}"
 
     Args:
-        cluster_bus_ids: Set of bus IDs in the cluster
-        bus_by_id: Bus lookup dictionary
-        threshold_km: Maximum spatial extent (km) for a single cluster
+        buses: Buses in this substation
+        area: Area number
+        zone: Zone number
+        index: Substation index for uniqueness
 
     Returns:
-        List of sub-clusters (each a set of bus IDs)
-    """
-    cluster_buses = [bus_by_id[bus_id] for bus_id in cluster_bus_ids]
-
-    # Check if we have lat/lon for all buses
-    buses_with_coords = [
-        bus for bus in cluster_buses
-        if bus.latitude is not None and bus.longitude is not None
-    ]
-
-    if len(buses_with_coords) < 2:
-        # Not enough coordinate data, keep cluster as-is
-        return [cluster_bus_ids]
-
-    # Calculate spatial extent (simple bounding box diagonal)
-    lats = [bus.latitude for bus in buses_with_coords]
-    lons = [bus.longitude for bus in buses_with_coords]
-
-    lat_span = max(lats) - min(lats)
-    lon_span = max(lons) - min(lons)
-
-    # Approximate distance in km (rough conversion at mid-latitudes)
-    # 1 degree lat ≈ 111 km, 1 degree lon ≈ 111 * cos(lat) km
-    avg_lat = sum(lats) / len(lats)
-    import math
-    lat_km = lat_span * 111.0
-    lon_km = lon_span * 111.0 * math.cos(math.radians(avg_lat))
-    extent_km = math.sqrt(lat_km**2 + lon_km**2)
-
-    if extent_km <= threshold_km:
-        # Cluster is small enough, keep as-is
-        return [cluster_bus_ids]
-
-    # Cluster is too large, split it
-    # Use a simple approach: split by median lat/lon
-    median_lat = median(lats)
-    median_lon = median(lons)
-
-    # Create 4 quadrants
-    quadrants = [set() for _ in range(4)]
-
-    for bus in cluster_buses:
-        if bus.latitude is not None and bus.longitude is not None:
-            # Assign to quadrant based on lat/lon relative to median
-            quadrant_idx = 0
-            if bus.latitude >= median_lat:
-                quadrant_idx += 2
-            if bus.longitude >= median_lon:
-                quadrant_idx += 1
-            quadrants[quadrant_idx].add(bus.id)
-        else:
-            # Bus without coordinates goes to first quadrant
-            quadrants[0].add(bus.id)
-
-    # Filter out empty quadrants and recursively check their extent
-    result = []
-    for quadrant in quadrants:
-        if quadrant:
-            # Recursively check if quadrant needs further splitting
-            sub_clusters = _split_cluster_by_spatial_extent(
-                quadrant, bus_by_id, threshold_km
-            )
-            result.extend(sub_clusters)
-
-    return result if result else [cluster_bus_ids]
-
-
-def _create_substation_from_cluster(
-    cluster_idx: int,
-    cluster_buses: list[BusModel],
-) -> SubstationModel:
-    """Create a SubstationModel from a cluster of buses.
-
-    Infers substation properties from the buses in the cluster:
-    - name: Heuristic based on bus names (common prefix or longest name)
-    - voltage_levels: Distinct base_kv values in cluster
-    - nominal_kv: Maximum voltage level
-    - area/zone: Majority vote from buses
-    - lat/lon: Average/median of bus coordinates
-
-    Args:
-        cluster_idx: Index of this cluster (for unique naming)
-        cluster_buses: List of buses in the cluster
-
-    Returns:
-        SubstationModel for this cluster
-    """
-    if not cluster_buses:
-        raise ValueError("Cannot create substation from empty cluster")
-
-    substation_id = str(uuid.uuid4())
-
-    # Infer name from bus names
-    name = _infer_substation_name(cluster_buses, cluster_idx)
-
-    # Collect voltage levels
-    voltage_levels = sorted(set(bus.base_kv for bus in cluster_buses))
-    nominal_kv = max(voltage_levels) if voltage_levels else None
-
-    # Determine area and zone by majority vote
-    area = _majority_vote([bus.area for bus in cluster_buses])
-    zone = _majority_vote([bus.zone for bus in cluster_buses])
-
-    # Calculate average lat/lon if available
-    lats = [bus.latitude for bus in cluster_buses if bus.latitude is not None]
-    lons = [bus.longitude for bus in cluster_buses if bus.longitude is not None]
-
-    latitude = sum(lats) / len(lats) if lats else None
-    longitude = sum(lons) / len(lons) if lons else None
-
-    return SubstationModel(
-        id=substation_id,
-        name=name,
-        area=area,
-        zone=zone,
-        nominal_kv=nominal_kv,
-        voltage_levels=voltage_levels,
-        latitude=latitude,
-        longitude=longitude,
-    )
-
-
-def _infer_substation_name(buses: list[BusModel], cluster_idx: int) -> str:
-    """Infer a substation name from bus names.
-
-    Uses heuristics:
-    1. Find common prefix of bus names
-    2. If no common prefix, use the longest bus name
-    3. If no good name, use "Substation_N"
-
-    Args:
-        buses: List of buses in the substation
-        cluster_idx: Index of this cluster
-
-    Returns:
-        Inferred substation name
+        Tuple of (name, name_source)
     """
     if not buses:
-        return f"Substation_{cluster_idx + 1}"
-
-    bus_names = [bus.name for bus in buses if bus.name]
-
-    if not bus_names:
-        return f"Substation_{cluster_idx + 1}"
+        return f"Station_{area or 0}_{zone or 0}_{index}", "fallback"
 
     # Try to find common prefix
-    if len(bus_names) > 1:
-        common_prefix = _find_common_prefix(bus_names)
-        if common_prefix and len(common_prefix) >= 3:
-            # Clean up prefix (remove trailing numbers, spaces, underscores)
-            cleaned = common_prefix.rstrip("0123456789 _-")
-            if len(cleaned) >= 3:
-                return cleaned
+    names = [b.name for b in buses if b.name]
+    if not names:
+        return f"Station_{area or 0}_{zone or 0}_{index}", "fallback"
 
-    # Fall back to longest name
-    longest_name = max(bus_names, key=len)
-    if len(longest_name) > 5:
-        return longest_name
+    # Find longest common prefix
+    prefix = _find_common_prefix(names)
 
-    # Last resort: use first bus name or default
-    if bus_names[0]:
-        return bus_names[0]
+    if prefix and len(prefix) >= 3:
+        return prefix.strip(), "prefix"
 
-    return f"Substation_{cluster_idx + 1}"
+    # Fallback
+    return f"Station_{area or 0}_{zone or 0}_{index}", "fallback"
 
 
 def _find_common_prefix(strings: list[str]) -> str:
-    """Find the longest common prefix of a list of strings.
-
-    Args:
-        strings: List of strings
-
-    Returns:
-        Common prefix string (empty if no common prefix)
-    """
+    """Find the longest common prefix of a list of strings."""
     if not strings:
         return ""
 
     # Start with first string
     prefix = strings[0]
 
-    for string in strings[1:]:
-        # Reduce prefix until it matches beginning of string
-        while not string.startswith(prefix):
+    for s in strings[1:]:
+        # Shorten prefix until it matches
+        while not s.startswith(prefix) and prefix:
             prefix = prefix[:-1]
-            if not prefix:
-                return ""
+
+        if not prefix:
+            break
 
     return prefix
 
 
-def _majority_vote(values: list[Optional[int]]) -> Optional[int]:
-    """Return the most common value from a list, or None if list is empty.
-
-    Args:
-        values: List of values (can contain None)
-
-    Returns:
-        Most common non-None value, or None if no values
-    """
-    # Filter out None values
-    non_none_values = [v for v in values if v is not None]
-
-    if not non_none_values:
-        return None
-
-    # Count occurrences
-    counts = defaultdict(int)
-    for value in non_none_values:
-        counts[value] += 1
-
-    # Return most common
-    return max(counts, key=counts.get)
-
-
-def assign_substations_to_buses(
+def update_substation_voltage_levels(
+    substations: list[SubstationModel],
     buses: list[BusModel],
-    bus_to_substation_map: dict[str, str],
-) -> list[BusModel]:
-    """Assign substation IDs to buses based on a mapping.
-
-    Creates new BusModel instances with substation_id set.
+) -> None:
+    """
+    Update voltage_levels for each substation based on its buses.
 
     Args:
-        buses: List of buses to update
-        bus_to_substation_map: Mapping from bus_id to substation_id
+        substations: List of substations (modified in place)
+        buses: List of buses with substation_id set
+    """
+    # Group buses by substation
+    buses_by_sub: dict[str, list[BusModel]] = defaultdict(list)
+    for bus in buses:
+        if bus.substation_id:
+            buses_by_sub[bus.substation_id].append(bus)
+
+    # Update voltage levels
+    sub_by_id = {s.id: s for s in substations}
+
+    for sub_id, sub_buses in buses_by_sub.items():
+        if sub_id in sub_by_id:
+            sub = sub_by_id[sub_id]
+            voltage_levels = sorted(set(b.base_kv for b in sub_buses), reverse=True)
+            sub.voltage_levels = voltage_levels
+            if voltage_levels and sub.nominal_kv is None:
+                sub.nominal_kv = max(voltage_levels)
+
+
+def apply_jumper_rule(
+    buses: list[BusModel],
+    branches: list,  # AcBranchModel
+    r_x_threshold: float = 0.0001,
+) -> dict[str, str]:
+    """
+    Apply hardened jumper rule to group buses connected by low-impedance branches.
+
+    A "jumper" is a branch with abs(R) + abs(X) <= threshold.
+    Buses connected by jumpers are considered part of the same substation.
+
+    Args:
+        buses: List of buses
+        branches: List of AC branches
+        r_x_threshold: Threshold for R+X sum
 
     Returns:
-        New list of BusModel instances with substation_id assigned
+        Mapping of bus_id -> group_id (representative bus ID for the group)
     """
-    updated_buses = []
+    # Build adjacency for jumper connections
+    bus_id_set = {b.id for b in buses}
+    jumper_adj: dict[str, set[str]] = defaultdict(set)
 
-    for bus in buses:
-        substation_id = bus_to_substation_map.get(bus.id)
+    for branch in branches:
+        if branch.from_bus_id not in bus_id_set or branch.to_bus_id not in bus_id_set:
+            continue
 
-        # Create new bus with substation_id set
-        updated_bus = bus.model_copy(update={"substation_id": substation_id})
-        updated_buses.append(updated_bus)
+        r = abs(branch.r or 0)
+        x = abs(branch.x or 0)
 
-    return updated_buses
+        if r + x <= r_x_threshold:
+            jumper_adj[branch.from_bus_id].add(branch.to_bus_id)
+            jumper_adj[branch.to_bus_id].add(branch.from_bus_id)
+
+    # Find connected components using union-find
+    parent: dict[str, str] = {b.id: b.id for b in buses}
+
+    def find(x: str) -> str:
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(x: str, y: str) -> None:
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+
+    for bus_id, neighbors in jumper_adj.items():
+        for neighbor in neighbors:
+            union(bus_id, neighbor)
+
+    # Return mapping to group representative
+    return {bus_id: find(bus_id) for bus_id in parent}

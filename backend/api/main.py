@@ -1,64 +1,45 @@
-"""FastAPI application entrypoint for SLD Viewer backend.
-
-Creates and configures the FastAPI app with CORS, routers, and settings.
 """
-
-import sys
-from pathlib import Path
-
-# Ensure VeraGrid is in path (in case uvicorn reload changes context)
-# This file is in backend/api/main.py, so project root is 2 levels up
-_project_root = Path(__file__).resolve().parent.parent.parent
-_veragrid_path = _project_root / "VeraGrid" / "src"
-if _veragrid_path.exists() and str(_veragrid_path) not in sys.path:
-    sys.path.insert(0, str(_veragrid_path))
-
+FastAPI application entry point.
+"""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.core.config import get_settings
+from backend.core.config import settings
+from backend.api.routers import files, views
+
+# Create FastAPI app
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.app_version,
+    description="Cloud-based Single Line Diagram Viewer for PSS®E cases",
+)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(files.router)
+app.include_router(views.router)
 
 
-def create_app() -> FastAPI:
-    """Create and configure the FastAPI application.
-
-    Sets up CORS, includes routers, and loads application settings.
-
-    Returns:
-        Configured FastAPI application instance
-    """
-    app = FastAPI(
-        title="SLD Viewer API",
-        description="Single Line Diagram Viewer for PSSE power system data",
-        version="1.0.0",
-    )
-
-    # Load settings
-    settings = get_settings()
-
-    # Configure CORS
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origins,
-        allow_credentials=True,
-        allow_methods=["*"],  # Allow all HTTP methods
-        allow_headers=["*"],  # Allow all headers
-    )
-
-    # Include routers under /api/v1 prefix
-    # Routers will be implemented in subsequent steps
-    try:
-        from backend.api.routers import files, graphs
-
-        app.include_router(files.router, prefix="/api/v1", tags=["files"])
-        app.include_router(graphs.router, prefix="/api/v1", tags=["graphs"])
-    except (ImportError, AttributeError):
-        # Routers may not be fully implemented yet - this is OK for Phase 1 setup
-        pass
-
-    return app
+@app.get("/health")
+async def health_check() -> dict:
+    """Health check endpoint."""
+    return {"status": "ok", "version": settings.app_version}
 
 
-# Expose app at module level
-app = create_app()
-
+@app.get("/")
+async def root() -> dict:
+    """Root endpoint with API info."""
+    return {
+        "name": settings.app_name,
+        "version": settings.app_version,
+        "docs": "/docs",
+        "health": "/health",
+    }

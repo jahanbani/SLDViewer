@@ -1,387 +1,277 @@
-"""Tests for substation inference logic."""
-
+"""
+Tests for substation detection and naming utilities.
+"""
 import pytest
 
-from backend.core.graph.models import BranchModel, BusModel
 from backend.core.graph.substations import (
-    _build_strong_coupling_graph,
+    detect_substations_fallback,
+    generate_substation_name,
+    _extract_name_prefix,
     _find_common_prefix,
-    _infer_substation_name,
-    _majority_vote,
-    assign_substations_to_buses,
-    infer_substations,
+    update_substation_voltage_levels,
+    apply_jumper_rule,
+)
+from backend.core.graph.models import (
+    BusModel,
+    AcBranchModel,
+    SubstationModel,
+    BranchKind,
+    make_case_namespace,
+    make_bus_id,
 )
 
 
-def test_majority_vote():
-    """Test majority vote function."""
-    assert _majority_vote([1, 2, 1, 1]) == 1
-    assert _majority_vote([None, 2, 2]) == 2
-    assert _majority_vote([None, None]) is None
-    assert _majority_vote([]) is None
-    assert _majority_vote([5]) == 5
+@pytest.fixture
+def namespace():
+    """Create test namespace."""
+    return make_case_namespace("test-case")
 
 
-def test_find_common_prefix():
-    """Test common prefix finding."""
-    assert _find_common_prefix(["abc123", "abc456", "abc789"]) == "abc"
-    assert _find_common_prefix(["Station_A_1", "Station_A_2"]) == "Station_A_"
-    assert _find_common_prefix(["xyz", "abc"]) == ""
-    assert _find_common_prefix([]) == ""
-    assert _find_common_prefix(["single"]) == "single"
-
-
-def test_infer_substation_name():
-    """Test substation name inference."""
-    # Test common prefix
-    buses = [
-        BusModel(id="1", psse_number=1, name="MainSt_Bus1", base_kv=138.0, area=1, zone=1, owner=1),
-        BusModel(id="2", psse_number=2, name="MainSt_Bus2", base_kv=138.0, area=1, zone=1, owner=1),
-    ]
-    name = _infer_substation_name(buses, 0)
-    assert name == "MainSt_Bus"
-
-    # Test longest name
-    buses = [
-        BusModel(id="1", psse_number=1, name="Short", base_kv=138.0, area=1, zone=1, owner=1),
-        BusModel(id="2", psse_number=2, name="VeryLongName", base_kv=138.0, area=1, zone=1, owner=1),
-    ]
-    name = _infer_substation_name(buses, 0)
-    assert name == "VeryLongName"
-
-    # Test default name
-    buses = [
-        BusModel(id="1", psse_number=1, name="", base_kv=138.0, area=1, zone=1, owner=1),
-    ]
-    name = _infer_substation_name(buses, 5)
-    assert name == "Substation_6"
-
-
-def test_build_strong_coupling_graph():
-    """Test strong coupling graph construction."""
-    buses = [
-        BusModel(id="bus1", psse_number=1, name="Bus1", base_kv=138.0, area=1, zone=1, owner=1),
-        BusModel(id="bus2", psse_number=2, name="Bus2", base_kv=138.0, area=1, zone=1, owner=1),
-        BusModel(id="bus3", psse_number=3, name="Bus3", base_kv=138.0, area=1, zone=1, owner=1),
-        BusModel(id="bus4", psse_number=4, name="Bus4", base_kv=69.0, area=1, zone=1, owner=1),
-    ]
-
-    branches = [
-        # Zero impedance line (switch) - bus1 <-> bus2
-        BranchModel(
-            id="br1",
-            from_bus_id="bus1",
-            to_bus_id="bus2",
-            circuit="1",
-            type="line",
-            r=0.0,
-            x=0.0,
-            b=0.0,
-            g=0.0,
-        ),
-        # Small impedance transformer - bus1 <-> bus4 (connects voltage levels)
-        BranchModel(
-            id="br2",
-            from_bus_id="bus1",
-            to_bus_id="bus4",
-            circuit="1",
-            type="xfmr",
-            r=0.001,
-            x=0.005,
-            b=0.0,
-            g=0.0,
-        ),
-        # Large impedance line - bus2 <-> bus3 (transmission line, not in same station)
-        BranchModel(
-            id="br3",
-            from_bus_id="bus2",
-            to_bus_id="bus3",
-            circuit="1",
-            type="line",
-            r=0.1,
-            x=0.5,
-            b=0.01,
-            g=0.0,
-        ),
-    ]
-
-    bus_by_id = {bus.id: bus for bus in buses}
-    graph = _build_strong_coupling_graph(buses, branches, bus_by_id)
-
-    # Check nodes
-    assert set(graph.nodes()) == {"bus1", "bus2", "bus3", "bus4"}
-
-    # Check edges - should have bus1-bus2 (zero impedance) and bus1-bus4 (xfmr)
-    assert graph.has_edge("bus1", "bus2")  # Zero impedance
-    assert graph.has_edge("bus1", "bus4")  # Transformer
-    assert not graph.has_edge("bus2", "bus3")  # Large impedance, not strongly coupled
-
-
-def test_infer_substations_simple():
-    """Test basic substation inference without spatial splitting."""
-    # Create a simple scenario: two substations
-    # Station 1: bus1, bus2 (connected by zero impedance)
-    # Station 2: bus3, bus4 (connected by transformer)
-    buses = [
-        BusModel(id="bus1", psse_number=101, name="StationA_138", base_kv=138.0, area=1, zone=1, owner=1),
-        BusModel(id="bus2", psse_number=102, name="StationA_69", base_kv=69.0, area=1, zone=1, owner=1),
-        BusModel(id="bus3", psse_number=201, name="StationB_230", base_kv=230.0, area=2, zone=2, owner=1),
-        BusModel(id="bus4", psse_number=202, name="StationB_138", base_kv=138.0, area=2, zone=2, owner=1),
-    ]
-
-    branches = [
-        # Station A: zero impedance between bus1 and bus2
-        BranchModel(
-            id="br1",
-            from_bus_id="bus1",
-            to_bus_id="bus2",
-            circuit="1",
-            type="line",
-            r=0.0,
-            x=0.0,
-            b=0.0,
-            g=0.0,
-        ),
-        # Station B: transformer between bus3 and bus4
-        BranchModel(
-            id="br2",
-            from_bus_id="bus3",
-            to_bus_id="bus4",
-            circuit="1",
-            type="xfmr",
-            r=0.001,
-            x=0.01,
-            b=0.0,
-            g=0.0,
-        ),
-        # Transmission line between stations (high impedance)
-        BranchModel(
-            id="br3",
-            from_bus_id="bus2",
-            to_bus_id="bus3",
-            circuit="1",
-            type="line",
-            r=0.5,
-            x=1.0,
-            b=0.01,
-            g=0.0,
-        ),
-    ]
-
-    substations, bus_to_sub_map = infer_substations(buses, branches)
-
-    # Should have 2 substations
-    assert len(substations) == 2
-
-    # Check that bus1 and bus2 are in same substation
-    sub1 = bus_to_sub_map["bus1"]
-    sub2 = bus_to_sub_map["bus2"]
-    assert sub1 == sub2
-
-    # Check that bus3 and bus4 are in same substation
-    sub3 = bus_to_sub_map["bus3"]
-    sub4 = bus_to_sub_map["bus4"]
-    assert sub3 == sub4
-
-    # Check that the two stations are different
-    assert sub1 != sub3
-
-    # Check substation properties
-    sub_a = next(s for s in substations if s.id == sub1)
-    assert set(sub_a.voltage_levels) == {138.0, 69.0}
-    assert sub_a.nominal_kv == 138.0
-    assert sub_a.area == 1
-    assert sub_a.zone == 1
-
-    sub_b = next(s for s in substations if s.id == sub3)
-    assert set(sub_b.voltage_levels) == {230.0, 138.0}
-    assert sub_b.nominal_kv == 230.0
-    assert sub_b.area == 2
-    assert sub_b.zone == 2
-
-
-def test_assign_substations_to_buses():
-    """Test assigning substation IDs to buses."""
-    buses = [
-        BusModel(id="bus1", psse_number=1, name="Bus1", base_kv=138.0, area=1, zone=1, owner=1),
-        BusModel(id="bus2", psse_number=2, name="Bus2", base_kv=138.0, area=1, zone=1, owner=1),
-    ]
-
-    bus_to_sub_map = {
-        "bus1": "sub_a",
-        "bus2": "sub_a",
-    }
-
-    updated_buses = assign_substations_to_buses(buses, bus_to_sub_map)
-
-    assert len(updated_buses) == 2
-    assert updated_buses[0].substation_id == "sub_a"
-    assert updated_buses[1].substation_id == "sub_a"
-    # Original buses should not be modified
-    assert buses[0].substation_id is None
-    assert buses[1].substation_id is None
-
-
-def test_infer_substations_isolated_buses():
-    """Test that isolated buses get their own substations."""
-    buses = [
-        BusModel(id="bus1", psse_number=1, name="Bus1", base_kv=138.0, area=1, zone=1, owner=1),
-        BusModel(id="bus2", psse_number=2, name="Bus2", base_kv=138.0, area=1, zone=1, owner=1),
-        BusModel(id="bus3", psse_number=3, name="Bus3", base_kv=138.0, area=1, zone=1, owner=1),
-    ]
-
-    # No branches - all buses are isolated
-    branches = []
-
-    substations, bus_to_sub_map = infer_substations(buses, branches)
-
-    # Each bus should get its own substation
-    assert len(substations) == 3
-    assert bus_to_sub_map["bus1"] != bus_to_sub_map["bus2"]
-    assert bus_to_sub_map["bus2"] != bus_to_sub_map["bus3"]
-    assert bus_to_sub_map["bus1"] != bus_to_sub_map["bus3"]
-
-
-def test_infer_substations_with_lat_lon():
-    """Test substation inference with geographic coordinates."""
-    # Create two groups of buses that are geographically separated
-    # Group 1: bus1, bus2, bus3 (close together, within same station)
-    # Group 2: bus4, bus5 (far away, different station)
-    buses = [
-        # Group 1 - close together (within 1-2 km)
+@pytest.fixture
+def sample_buses(namespace):
+    """Create sample buses for testing."""
+    return [
         BusModel(
-            id="bus1",
+            id=make_bus_id(namespace, 1),
             psse_number=1,
-            name="StationA_Bus1",
-            base_kv=138.0,
+            name="NORTH_HV_1",
+            base_kv=345.0,
             area=1,
             zone=1,
-            owner=1,
-            latitude=40.0,
-            longitude=-74.0,
         ),
         BusModel(
-            id="bus2",
+            id=make_bus_id(namespace, 2),
             psse_number=2,
-            name="StationA_Bus2",
-            base_kv=138.0,
+            name="NORTH_HV_2",
+            base_kv=345.0,
             area=1,
             zone=1,
-            owner=1,
-            latitude=40.005,  # About 0.5 km away
-            longitude=-74.005,
         ),
         BusModel(
-            id="bus3",
+            id=make_bus_id(namespace, 3),
             psse_number=3,
-            name="StationA_Bus3",
-            base_kv=69.0,
+            name="NORTH_LV_1",
+            base_kv=138.0,
             area=1,
             zone=1,
-            owner=1,
-            latitude=40.01,  # About 1 km away
-            longitude=-74.01,
         ),
-        # Group 2 - far away (about 55 km)
         BusModel(
-            id="bus4",
+            id=make_bus_id(namespace, 4),
             psse_number=4,
-            name="StationB_Bus4",
-            base_kv=230.0,
+            name="SOUTH_HV_1",
+            base_kv=345.0,
             area=2,
             zone=2,
-            owner=1,
-            latitude=40.5,
-            longitude=-74.5,
         ),
         BusModel(
-            id="bus5",
+            id=make_bus_id(namespace, 5),
             psse_number=5,
-            name="StationB_Bus5",
+            name="SOUTH_LV_1",
             base_kv=138.0,
             area=2,
             zone=2,
-            owner=1,
-            latitude=40.505,
-            longitude=-74.505,
         ),
     ]
 
-    branches = [
-        # Station A - all connected with small impedance
-        BranchModel(
-            id="br1",
-            from_bus_id="bus1",
-            to_bus_id="bus2",
-            circuit="1",
-            type="line",
-            r=0.0001,
-            x=0.0001,
-            b=0.0,
-            g=0.0,
-        ),
-        BranchModel(
-            id="br2",
-            from_bus_id="bus2",
-            to_bus_id="bus3",
-            circuit="1",
-            type="xfmr",  # Transformer connecting voltage levels
-            r=0.001,
-            x=0.01,
-            b=0.0,
-            g=0.0,
-        ),
-        # Station B - connected with transformer
-        BranchModel(
-            id="br3",
-            from_bus_id="bus4",
-            to_bus_id="bus5",
-            circuit="1",
-            type="xfmr",
-            r=0.001,
-            x=0.01,
-            b=0.0,
-            g=0.0,
-        ),
-        # Long transmission line between stations (should not create strong coupling)
-        BranchModel(
-            id="br4",
-            from_bus_id="bus3",
-            to_bus_id="bus4",
-            circuit="1",
-            type="line",
-            r=0.5,
-            x=1.5,
-            b=0.01,
-            g=0.0,
-        ),
-    ]
 
-    substations, bus_to_sub_map = infer_substations(buses, branches, spatial_threshold_km=10.0)
+class TestExtractNamePrefix:
+    """Tests for _extract_name_prefix."""
 
-    # Check Group 1 (Station A) - all buses should be in same substation
-    sub1 = bus_to_sub_map["bus1"]
-    sub2 = bus_to_sub_map["bus2"]
-    sub3 = bus_to_sub_map["bus3"]
-    assert sub1 == sub2 == sub3, "Buses in Station A should be in same substation"
+    def test_simple_prefix(self):
+        """Test extraction of simple prefix."""
+        # Extracts prefix by removing trailing numbers
+        result = _extract_name_prefix("NORTH_HV_1")
+        assert result is not None
+        assert "NORTH" in result
 
-    # Check Group 2 (Station B) - all buses should be in same substation
-    sub4 = bus_to_sub_map["bus4"]
-    sub5 = bus_to_sub_map["bus5"]
-    assert sub4 == sub5, "Buses in Station B should be in same substation"
+    def test_prefix_with_bus_suffix(self):
+        """Test removal of BUS suffix."""
+        assert _extract_name_prefix("STATION_A BUS 1") == "STATION_A"
 
-    # Check that the two stations are different
-    assert sub1 != sub4, "Station A and Station B should be different substations"
+    def test_prefix_with_kv_suffix(self):
+        """Test removal of kV suffix."""
+        # The function removes the kV suffix
+        result = _extract_name_prefix("PLANT_345KV")
+        assert result is not None
+        assert "PLANT" in result
 
-    # Should have exactly 2 substations
-    assert len(substations) == 2
+    def test_short_name_returns_none(self):
+        """Test that short names return None."""
+        assert _extract_name_prefix("AB") is None
 
-    # Check substation properties for Station A
-    sub_a = next(s for s in substations if s.id == sub1)
-    assert set(sub_a.voltage_levels) == {138.0, 69.0}
-    assert sub_a.nominal_kv == 138.0
+    def test_numeric_only_returns_none(self):
+        """Test that numeric-only names return None."""
+        assert _extract_name_prefix("12345") is None
 
-    # Check substation properties for Station B
-    sub_b = next(s for s in substations if s.id == sub4)
-    assert set(sub_b.voltage_levels) == {230.0, 138.0}
-    assert sub_b.nominal_kv == 230.0
+
+class TestFindCommonPrefix:
+    """Tests for _find_common_prefix."""
+
+    def test_common_prefix_found(self):
+        """Test finding common prefix."""
+        names = ["NORTH_HV_1", "NORTH_HV_2", "NORTH_LV_1"]
+        assert _find_common_prefix(names) == "NORTH_"
+
+    def test_no_common_prefix(self):
+        """Test when no common prefix exists."""
+        names = ["NORTH_1", "SOUTH_1", "EAST_1"]
+        assert _find_common_prefix(names) == ""
+
+    def test_empty_list(self):
+        """Test with empty list."""
+        assert _find_common_prefix([]) == ""
+
+    def test_single_string(self):
+        """Test with single string."""
+        assert _find_common_prefix(["STATION"]) == "STATION"
+
+
+class TestGenerateSubstationName:
+    """Tests for generate_substation_name."""
+
+    def test_common_prefix_naming(self, sample_buses):
+        """Test naming from common prefix."""
+        north_buses = [b for b in sample_buses if "NORTH" in b.name]
+        name, source = generate_substation_name(north_buses)
+        assert "NORTH" in name
+        assert source == "prefix"
+
+    def test_fallback_naming(self):
+        """Test fallback naming when no common prefix."""
+        buses = [
+            BusModel(id="1", psse_number=1, name="A", base_kv=138.0),
+            BusModel(id="2", psse_number=2, name="B", base_kv=138.0),
+        ]
+        name, source = generate_substation_name(buses, area=1, zone=2, index=0)
+        assert source == "fallback"
+        assert "Station" in name
+
+    def test_empty_buses_fallback(self):
+        """Test fallback with empty buses."""
+        name, source = generate_substation_name([], area=5, zone=10, index=3)
+        assert source == "fallback"
+        assert "5" in name and "10" in name
+
+
+class TestDetectSubstationsFallback:
+    """Tests for detect_substations_fallback."""
+
+    def test_groups_by_prefix(self, sample_buses, namespace):
+        """Test that buses are grouped by name prefix."""
+        substations, mapping = detect_substations_fallback(sample_buses, namespace)
+
+        # Should have at least 2 groups (NORTH and SOUTH)
+        assert len(substations) >= 2
+
+        # All buses should be mapped
+        assert len(mapping) == len(sample_buses)
+
+    def test_voltage_levels_collected(self, sample_buses, namespace):
+        """Test that voltage levels are collected for each substation."""
+        substations, _ = detect_substations_fallback(sample_buses, namespace)
+
+        for sub in substations:
+            assert len(sub.voltage_levels) >= 1
+
+    def test_deterministic_ids(self, sample_buses, namespace):
+        """Test that substation IDs are deterministic."""
+        subs1, _ = detect_substations_fallback(sample_buses, namespace)
+        subs2, _ = detect_substations_fallback(sample_buses, namespace)
+
+        ids1 = {s.id for s in subs1}
+        ids2 = {s.id for s in subs2}
+        assert ids1 == ids2
+
+
+class TestUpdateSubstationVoltageLevels:
+    """Tests for update_substation_voltage_levels."""
+
+    def test_updates_voltage_levels(self, namespace):
+        """Test voltage level update."""
+        sub = SubstationModel(id="sub1", name="Station A", voltage_levels=[])
+
+        buses = [
+            BusModel(
+                id="bus1",
+                psse_number=1,
+                name="BUS1",
+                base_kv=345.0,
+                substation_id="sub1",
+            ),
+            BusModel(
+                id="bus2",
+                psse_number=2,
+                name="BUS2",
+                base_kv=138.0,
+                substation_id="sub1",
+            ),
+        ]
+
+        update_substation_voltage_levels([sub], buses)
+
+        assert 345.0 in sub.voltage_levels
+        assert 138.0 in sub.voltage_levels
+        assert sub.nominal_kv == 345.0
+
+
+class TestApplyJumperRule:
+    """Tests for apply_jumper_rule."""
+
+    def test_groups_jumper_connected_buses(self, namespace):
+        """Test that buses connected by jumpers are grouped."""
+        buses = [
+            BusModel(id="bus1", psse_number=1, name="BUS1", base_kv=138.0),
+            BusModel(id="bus2", psse_number=2, name="BUS2", base_kv=138.0),
+            BusModel(id="bus3", psse_number=3, name="BUS3", base_kv=138.0),
+        ]
+
+        # Jumper between bus1 and bus2
+        branches = [
+            AcBranchModel(
+                id="br1",
+                from_bus_id="bus1",
+                to_bus_id="bus2",
+                kind=BranchKind.LINE,
+                r=0.0,
+                x=0.0,
+            ),
+            # Normal line between bus2 and bus3
+            AcBranchModel(
+                id="br2",
+                from_bus_id="bus2",
+                to_bus_id="bus3",
+                kind=BranchKind.LINE,
+                r=0.01,
+                x=0.05,
+            ),
+        ]
+
+        groups = apply_jumper_rule(buses, branches)
+
+        # bus1 and bus2 should be in same group
+        assert groups["bus1"] == groups["bus2"]
+        # bus3 should be in different group
+        assert groups["bus3"] != groups["bus1"]
+
+    def test_no_jumpers(self, namespace):
+        """Test when there are no jumpers."""
+        buses = [
+            BusModel(id="bus1", psse_number=1, name="BUS1", base_kv=138.0),
+            BusModel(id="bus2", psse_number=2, name="BUS2", base_kv=138.0),
+        ]
+
+        branches = [
+            AcBranchModel(
+                id="br1",
+                from_bus_id="bus1",
+                to_bus_id="bus2",
+                kind=BranchKind.LINE,
+                r=0.01,
+                x=0.1,
+            ),
+        ]
+
+        groups = apply_jumper_rule(buses, branches)
+
+        # Each bus should be its own group
+        assert groups["bus1"] != groups["bus2"]

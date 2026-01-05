@@ -1,66 +1,31 @@
-"""Configuration settings for SLD Viewer backend.
-
-Uses Pydantic v2 BaseSettings to load configuration from environment variables
-with sensible defaults. Settings can be overridden via environment variables.
 """
-
-import sys
-from functools import lru_cache
+Application configuration using Pydantic Settings.
+"""
 from pathlib import Path
-
-from pydantic_settings import BaseSettings
-
-
-def _get_project_root() -> Path:
-    """Get the project root directory (SLDViewer folder)."""
-    # This file is in backend/core/config.py
-    # Project root is 2 levels up
-    config_file = Path(__file__).resolve()
-    project_root = config_file.parent.parent.parent
-    return project_root
-
-
-def _get_default_storage_root() -> str:
-    """Get default storage root as absolute path."""
-    project_root = _get_project_root()
-    storage_path = project_root / "backend" / "storage" / "user_files"
-    return str(storage_path.resolve())
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Application settings with defaults from SLD_PLAN.md.
+    """Application settings loaded from environment variables."""
 
-    All settings can be overridden via environment variables using the
-    same field names (uppercase, e.g., STORAGE_ROOT, BUS_LIMIT_DEFAULT).
-    """
+    model_config = SettingsConfigDict(env_prefix="SLD_", env_file=".env")
 
-    # Storage configuration - defaults to absolute path relative to project root
-    storage_root: str = _get_default_storage_root()
+    # App info
+    app_name: str = "SLD Viewer"
+    app_version: str = "0.1.0"
+    debug: bool = False
 
-    # CORS configuration
-    cors_origins: list[str] = ["http://localhost:5173"]
+    # Storage
+    storage_root: Path = Path("storage/user_files")
+    max_upload_size_mb: int = 100
 
-    # View limits (from SLD_PLAN.md section 9)
-    bus_limit_default: int = 300  # BUS_LIMIT_DEFAULT
-    substation_limit_default: int = 500  # SUBSTATION_LIMIT_DEFAULT
-    initial_view_limit: int = 100  # INITIAL_VIEW_LIMIT
+    # Cache settings
+    cache_ttl_seconds: int = 3600  # 1 hour
+    cache_max_entries: int = 25
 
-    model_config = {
-        "env_file": ".env",
-        "env_file_encoding": "utf-8",
-        "case_sensitive": False,
-    }
+    # CORS
+    cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
 
-@lru_cache()
-def get_settings() -> Settings:
-    """Get singleton Settings instance.
-
-    Uses functools.lru_cache() to ensure only one Settings instance
-    is created and reused across the application.
-
-    Returns:
-        Settings: The singleton settings instance
-    """
-    return Settings()
-
+# Global settings instance
+settings = Settings()
