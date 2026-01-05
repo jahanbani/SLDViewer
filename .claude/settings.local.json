@@ -17,7 +17,8 @@
       "Bash(git filter-branch:*)",
       "Bash(git stash:*)",
       "Bash(git add:*)",
-      "Bash(git reset:*)"
+      "Bash(git reset:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nRefactor backend architecture and clean up codebase\n\n- Add storage, cache, errors, and timing modules\n- Add slicer and veragrid_adapter for graph processing  \n- Add views API router\n- Update tests with new fixtures and test files\n- Remove old documentation and unused files\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")"
     ]
   }
 }
